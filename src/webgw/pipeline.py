@@ -7,6 +7,7 @@ from . import admission, outcome as oc, ranking, sections, tokens
 from .cache import CacheStore
 from .config import Config
 from .crawl_client import CrawlClient
+from .limits import ConcurrencyLimiter
 
 
 def _error_envelope(url: str, code: str, detail: str) -> dict:
@@ -116,6 +117,7 @@ async def fetch(
     cfg: Config,
     client: CrawlClient,
     cache: CacheStore | None = None,
+    limiter: ConcurrencyLimiter | None = None,
 ) -> dict:
     verdict = admission.check(url)
     if not verdict.allowed:
@@ -128,7 +130,12 @@ async def fetch(
             query, cfg, cache_state="hit", age_s=cached.age_s,
         )
 
-    crawled = await client.fetch(url)
+    # 併發上限:超過時排隊等待而非拒絕 —— 抓取本來就慢,多等優於直接失敗。
+    if limiter is not None:
+        async with limiter:
+            crawled = await client.fetch(url)
+    else:
+        crawled = await client.fetch(url)
     if not crawled.ok:
         # 抓取失敗但手上還有保留期內的舊資料 —— 回舊的並標記 stale。
         # 反爬阻擋在實測中很常見,此時一份舊內容遠勝於一個錯誤碼。

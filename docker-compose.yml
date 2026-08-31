@@ -1,7 +1,7 @@
 services:
   webgw:
     build: .
-    image: webgw:0.1.0
+    image: webgw:0.2.0
     container_name: webgw
     ports:
       # 本機測試綁 loopback。上線時由 k8s Service (NodePort) 處理對外暴露,
@@ -24,6 +24,11 @@ services:
       CACHE_DOMAIN_RULES: "${CACHE_DOMAIN_RULES:-}"
       CACHE_MAX_BYTES: "${CACHE_MAX_BYTES:-2147483648}"
       CACHE_CLEANUP_INTERVAL_S: "${CACHE_CLEANUP_INTERVAL_S:-3600}"
+      # stateless 會讓客戶端取不到工具清單(實測 OpenCode),保持關閉。
+      MCP_STATELESS: "${MCP_STATELESS:-0}"
+      WEBGW_AUTH_TOKEN: "${WEBGW_AUTH_TOKEN:-}"
+      MAX_CONCURRENT_FETCHES: "${MAX_CONCURRENT_FETCHES:-4}"
+      RATE_LIMIT_PER_MINUTE: "${RATE_LIMIT_PER_MINUTE:-60}"
     extra_hosts:
       # Linux 上 host.docker.internal 預設不存在,補上以保持跨平台一致。
       - "host.docker.internal:host-gateway"

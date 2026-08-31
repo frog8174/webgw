@@ -75,3 +75,58 @@ def test_section_tokens_recorded():
     md = "## A\n" + _prose("word")
     sec = sections.split(md)[0]
     assert sec.tokens > 0
+
+
+def test_stateless_defaults_off(monkeypatch):
+    """stateless 時伺服器不發 Mcp-Session-Id,實測 OpenCode 會取不到工具清單。
+
+    預設必須關閉 —— 快取是 SQLite 單檔、replicas 鎖在 1,stateless 換不到擴展性。
+    """
+    import importlib
+
+    from webgw import config
+
+    monkeypatch.delenv("MCP_STATELESS", raising=False)
+    importlib.reload(config)
+    assert config.Config().mcp_stateless is False
+
+    monkeypatch.setenv("MCP_STATELESS", "1")
+    importlib.reload(config)
+    assert config.Config().mcp_stateless is True
+    monkeypatch.delenv("MCP_STATELESS", raising=False)
+    importlib.reload(config)
+
+
+async def test_get_mcp_returns_405_but_other_paths_pass():
+    """GET /mcp 必須回 405,其餘路徑不受影響。
+
+    那條 SSE 串流是選用的伺服器→客戶端推送通道,本服務從不推送。
+    SDK 預設回 200 並永久佔住一條 HTTP/1.1 連線,實測會讓 OpenCode 約半數
+    連線卡死(tools/list 排在串流後面,永遠送不出去)。
+    """
+    from webgw.server import DenyStandaloneGet
+
+    seen = {}
+
+    async def inner(scope, receive, send):
+        seen["passed_through"] = scope["path"]
+
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    wrapped = DenyStandaloneGet(inner)
+
+    # GET /mcp -> 405,不進入內層
+    await wrapped({"type": "http", "method": "GET", "path": "/mcp"}, None, send)
+    assert sent[0]["status"] == 405
+    assert ("passed_through" in seen) is False
+
+    # POST /mcp -> 放行
+    await wrapped({"type": "http", "method": "POST", "path": "/mcp"}, None, send)
+    assert seen["passed_through"] == "/mcp"
+
+    # GET /healthz -> 放行 (探針不能被擋掉)
+    await wrapped({"type": "http", "method": "GET", "path": "/healthz"}, None, send)
+    assert seen["passed_through"] == "/healthz"

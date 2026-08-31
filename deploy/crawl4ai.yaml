@@ -1,0 +1,93 @@
+# crawl4ai 上游服務。ClusterIP only —— 不對叢集外暴露。
+#
+# 它沒有認證、沒有 SSRF 准入檢查、也沒有限流(啟動日誌:per_principal=unlimited),
+# 這三樣都在 webgw 那一層。所以它只該被 webgw 連到。
+#
+# 使用前必改:Secret 裡的兩個值。
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: crawl4ai-secrets
+type: Opaque
+stringData:
+  # 沒設這個的話,0.9.2 只綁容器內 loopback,readiness 探針會一直失敗、
+  # Pod 永遠不會 Ready、Service 也就沒有 endpoint。
+  api-token: "CHANGE_ME"
+  # 必須 >= 32 字元,否則 gunicorn worker 每兩秒崩潰一次。
+  # 產生:openssl rand -hex 32
+  secret-key: "CHANGE_ME_AT_LEAST_32_CHARACTERS_LONG"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crawl4ai
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: crawl4ai }
+  template:
+    metadata:
+      labels: { app: crawl4ai }
+    spec:
+      containers:
+        - name: crawl4ai
+          # 用 digest 而非 :latest —— 標籤會被覆寫,digest 不會。
+          # 這個 digest 對應 C4AI_VERSION=0.9.2。
+          image: unclecode/crawl4ai@sha256:bd36741e7bdd35ddc1a05d9183e1d6d8cefb61dd640d944a25d026b76e917690
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 11235
+          env:
+            - name: CRAWL4AI_API_TOKEN
+              valueFrom:
+                secretKeyRef: { name: crawl4ai-secrets, key: api-token }
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: crawl4ai-secrets, key: secret-key }
+            - name: CRAWL4AI_HOOKS_ENABLED
+              value: "false"
+          volumeMounts:
+            # Chromium 需要共享記憶體。容器預設的 /dev/shm 只有 64MB,
+            # 分頁會隨機崩潰 —— 這是 k8s 上最常見的 headless 瀏覽器故障。
+            # docker run 用 --shm-size=1g,k8s 要靠這個 emptyDir 達成。
+            - name: dshm
+              mountPath: /dev/shm
+          readinessProbe:
+            # 從 Pod IP 打,不是從容器內 localhost 打 —— 這點很重要:
+            # 映像自帶的 HEALTHCHECK 是內部 curl localhost,服務只綁 loopback
+            # 時它照樣通過。k8s 探針從外部打,才驗得到真正的可達性。
+            httpGet: { path: /health, port: 11235 }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /health, port: 11235 }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "500m", memory: "2Gi" }
+            # 映像的健康檢查會在可用記憶體 < 2GB 時警告。
+            # /dev/shm 的 emptyDir 計入這個上限,所以 4Gi 實際可用約 3Gi。
+            limits:   { cpu: "2000m", memory: "4Gi" }
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+      # 刻意不掛持久卷。crawl4ai 自己的 SQLite 快取沒有 TTL、沒有容量上限,
+      # 會一直長到磁碟滿。不持久化反而避開這個問題 ——
+      # 持久化由 webgw 那層負責(14 天保留期 + 2GB 上限 + LRU 淘汰)。
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crawl4ai
+spec:
+  # ClusterIP:只有叢集內連得到。webgw 用 http://crawl4ai:11235 存取。
+  type: ClusterIP
+  selector: { app: crawl4ai }
+  ports:
+    - port: 11235
+      targetPort: 11235
+      protocol: TCP

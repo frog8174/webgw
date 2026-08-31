@@ -41,6 +41,29 @@ class Config:
     # DNS rebinding 防護的允許 Host 清單 (逗號分隔)。
     # 走 NodePort 時務必加入 <節點IP>:<port>,否則請求會被回 421。
     # 設為 "*" 停用防護 —— 僅建議在完全信任的區網。
+    # MCP stateless 模式。stateless 時伺服器不發 Mcp-Session-Id,
+    # 客戶端開的 GET /mcp SSE 串流沒有 session 可依附 —— 實測 OpenCode 會
+    # 因此取不到工具清單。預設關閉:反正快取是 SQLite 單檔、replicas 鎖在 1,
+    # stateless 目前買不到水平擴展。要擴展時再連同快取後端一起改。
+    # ── 限流 ────────────────────────────────────────────────────────
+    # 上游 crawl4ai 自己沒有任何限流 (啟動日誌:work queue per_principal=unlimited),
+    # 而每次抓取都會開一個真實瀏覽器分頁,是重負載。
+    max_concurrent_fetches: int = _int("MAX_CONCURRENT_FETCHES", 4)
+    # 每個來源每分鐘的請求上限。0 = 不限。
+    rate_limit_per_minute: int = _int("RATE_LIMIT_PER_MINUTE", 60)
+
+    # ── 認證 ────────────────────────────────────────────────────────
+    # 空字串 = 不啟用(僅適合單機 loopback 開發)。
+    # MCP 規格的傳輸安全章節:伺服器 SHOULD 對所有連線實作認證。
+    auth_token: str = os.environ.get("WEBGW_AUTH_TOKEN", "")
+
+    # MCP 回應格式。False = SSE 分幀 (event-stream),True = 純 JSON。
+    # 實測 SSE 模式下 OpenCode 的連線是間歇性的 (6 次中 3 次取不到工具清單):
+    # 它開了 GET /mcp 的 SSE 串流之後就不送 tools/list。
+    mcp_json_response: bool = os.environ.get("MCP_JSON_RESPONSE", "1") in ("1", "true", "True")
+
+    mcp_stateless: bool = os.environ.get("MCP_STATELESS", "0") in ("1", "true", "True")
+
     # ── 快取 ────────────────────────────────────────────────────────
     # 存 raw markdown。存 raw 而非 fit 的理由:換 query 重查同一頁不必重爬,
     # 而 fit_markdown 實測不可信(會砍掉文章標題留下登入元件)。
@@ -99,3 +122,22 @@ def parse_domain_rules(raw: str) -> dict[str, int]:
         except ValueError:
             continue
     return rules
+
+
+def effective_host(cfg: "Config") -> tuple[str, str | None]:
+    """決定實際綁定位址,並回傳需要提醒的訊息。
+
+    沒有設定 token 卻要綁 0.0.0.0,等於把服務對整個網路開放且不設防 ——
+    這正是實測中發生過的組合。此時強制降級為只綁 127.0.0.1。
+
+    做法照抄上游 crawl4ai 0.9.2:它在沒有 API token 時拒絕綁 0.0.0.0,
+    只綁容器內 loopback。那個設計當時擋住了一個真實的暴露風險。
+    """
+    if cfg.auth_token:
+        return cfg.host, None
+    if cfg.host not in ("127.0.0.1", "localhost", "::1"):
+        return "127.0.0.1", (
+            f"未設定 WEBGW_AUTH_TOKEN,拒絕綁定 {cfg.host},已降級為 127.0.0.1。"
+            "要對外提供服務請先設定 token。"
+        )
+    return cfg.host, "未設定 WEBGW_AUTH_TOKEN —— 所有端點皆無認證(僅適合本機開發)。"

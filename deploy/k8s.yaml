@@ -1,9 +1,14 @@
 # webgw NodePort 部署範本。
 #
-# 使用前必改的兩處:
-#   1. Secret 裡的 crawl4ai-token
-#   2. MCP_ALLOWED_HOSTS —— 必須包含 <節點IP>:<nodePort>,否則 DNS rebinding
+# 套用順序:先 crawl4ai.yaml,等它 Ready 之後再套這份。
+#
+# 使用前必改的三處:
+#   1. Secret 的 crawl4ai-token —— 要與 crawl4ai.yaml 的 api-token 相同
+#   2. Secret 的 webgw-auth-token —— 客戶端要帶的 Bearer token
+#   3. MCP_ALLOWED_HOSTS —— 必須包含 <節點IP>:<nodePort>,否則 DNS rebinding
 #      防護會把所有請求擋成 421。這是最容易踩的坑。
+#
+# 網路隔離見 networkpolicy.yaml(選用,但建議)。
 ---
 apiVersion: v1
 kind: Secret
@@ -12,14 +17,18 @@ metadata:
 type: Opaque
 stringData:
   crawl4ai-token: "CHANGE_ME"
+  # MCP 規格:伺服器 SHOULD 對所有連線實作認證。
+  # 留空的話 gateway 會拒絕綁 0.0.0.0,Service 將無法轉發。
+  webgw-auth-token: "CHANGE_ME"
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: webgw-config
 data:
-  # crawl4ai 在區網的位址
-  CRAWL4AI_BASE_URL: "http://192.168.1.50:11235"
+  # 叢集內的 Service DNS。crawl4ai 用 ClusterIP,不對外暴露。
+  # 跨 namespace 時寫全名:http://crawl4ai.<namespace>.svc.cluster.local:11235
+  CRAWL4AI_BASE_URL: "http://crawl4ai:11235"
   GATEWAY_HOST: "0.0.0.0"
   GATEWAY_PORT: "8080"
   SELECT_BUDGET_TOKENS: "4000"
@@ -33,6 +42,10 @@ data:
   CACHE_DOMAIN_RULES: "technews.tw=3600,www.ithome.com.tw=3600"
   CACHE_MAX_BYTES: "2147483648"
   CACHE_CLEANUP_INTERVAL_S: "3600"
+  # stateless 會讓客戶端取不到工具清單(實測 OpenCode),保持關閉。
+  MCP_STATELESS: "0"
+  MAX_CONCURRENT_FETCHES: "4"
+  RATE_LIMIT_PER_MINUTE: "60"
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -62,8 +75,8 @@ spec:
       containers:
         - name: webgw
           # 已推送至 Docker Hub。若要固定版本,改用 digest:
-          #   abc99012/webgw@sha256:409e1ccd441c466ad75cea4c369df65de09d30b2222f3c9d58dadbfc894d36e5
-          image: abc99012/webgw:0.1.0
+          #   abc99012/webgw@sha256:baf6e1b1a5dec9a997660441e8f2ef0a8020ea5fbb2e91e21f01bf9440a75558
+          image: abc99012/webgw:0.2.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -76,6 +89,9 @@ spec:
             - name: CRAWL4AI_TOKEN
               valueFrom:
                 secretKeyRef: { name: webgw-secrets, key: crawl4ai-token }
+            - name: WEBGW_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef: { name: webgw-secrets, key: webgw-auth-token }
           readinessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 5

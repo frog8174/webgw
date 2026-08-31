@@ -31,10 +31,15 @@ agent 接上地端模型使用。上游是自架的 crawl4ai。
 ## 映像
 
 ```
-docker pull abc99012/webgw:0.1.0
+docker pull abc99012/webgw:0.2.0
 ```
 
-digest `sha256:409e1ccd441c466ad75cea4c369df65de09d30b2222f3c9d58dadbfc894d36e5`
+digest `sha256:baf6e1b1a5dec9a997660441e8f2ef0a8020ea5fbb2e91e21f01bf9440a75558`
+
+> 版本沿革
+> - **0.2.0** — 加入 Bearer token 認證、併發/速率限制、`GET /mcp` 回 405
+> - 0.1.1 — 修正 stateless 預設開啟導致客戶端取不到工具清單
+> - 0.1.0 — 有上述 stateless bug,不要使用
 
 ## 本機測試
 
@@ -43,6 +48,27 @@ cp .env.example .env       # 填入 CRAWL4AI_TOKEN
 docker compose up --build
 curl http://127.0.0.1:8080/healthz
 ```
+
+## 接上 OpenCode
+
+寫入 `~/.config/opencode/opencode.json`(全域)或專案根目錄的 `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "webgw": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8080/mcp",
+      "enabled": true,
+      "timeout": 120,
+      "headers": { "Authorization": "Bearer <你的 WEBGW_AUTH_TOKEN>" }
+    }
+  }
+}
+```
+
+以 `opencode mcp list` 確認狀態應為 `connected`。
 
 ## 設定
 
@@ -54,6 +80,10 @@ curl http://127.0.0.1:8080/healthz
 | `SELECT_BUDGET_TOKENS` | `4000` | 選節預算 |
 | `PASSTHROUGH_MAX_TOKENS` | `4000` | 小於此值直接回全文 |
 | `FETCH_TIMEOUT_S` | `30` | 抓取逾時 |
+| `MCP_STATELESS` | `0` | 保持關閉。開啟會讓客戶端取不到工具清單 |
+| `WEBGW_AUTH_TOKEN` | — | Bearer token。**留空時強制只綁 127.0.0.1** |
+| `MAX_CONCURRENT_FETCHES` | `4` | 同時抓取上限,超過排隊 |
+| `RATE_LIMIT_PER_MINUTE` | `60` | 每分鐘請求上限,0 = 不限 |
 
 ## 中文驗證 (17 個案例)
 
@@ -66,6 +96,20 @@ curl http://127.0.0.1:8080/healthz
 CJK 用字元 bigram 而非分詞器。跨字集靠繁簡同形詞仍可運作,但完全不同形的詞
 (「訓練」vs「训练」) 會失效 —— 量化過繁簡轉換的效益是改善 3/7、持平 4/7,
 因 4k 命中已達 5/5,暫不引入相依。
+
+## 安全性
+
+| 項目 | 規格等級 | 狀態 |
+|---|---|---|
+| `Origin` 標頭驗證(防 DNS rebinding) | MUST | 由 MCP SDK 處理,實測惡意 Origin → 403 |
+| 無效協定版本回 400 | MUST | 實測通過 |
+| `GET /mcp` 回 SSE 或 405 | MUST | 回 405(本服務不推送) |
+| 對所有連線認證 | SHOULD | Bearer token,`/healthz` 除外 |
+| 本機執行只綁 localhost | SHOULD | 未設 token 時強制降級為 127.0.0.1 |
+
+SSRF 防護(阻擋私網/loopback/link-local、轉址後重驗、PDF 等二進位擋在送出前)
+見 `admission.py`。不依賴上游 crawl4ai 的內建防護 —— 它在 0.8.7~0.9.0 有過
+四次「檢查存在但有路徑沒套到」的 CVE。
 
 ## 尚未實作
 

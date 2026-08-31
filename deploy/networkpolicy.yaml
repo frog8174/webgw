@@ -1,0 +1,82 @@
+# 網路隔離。實作原始 spec 第 C 項:「容器層另加 egress 防火牆擋私有網段」。
+#
+# 這是 SSRF 的第三道防線,前兩道是:
+#   1. webgw 的 admission.py —— 送出前解析 DNS 並檢查所有回傳位址
+#   2. crawl4ai 0.9.2 的 egress pinning proxy —— 上游內建
+#
+# 為什麼要三道:上游在 0.8.7~0.9.0 有過四次「檢查存在但有路徑沒套到」的 CVE。
+# 前兩道都是應用層的字串/位址判斷,這一道在網路層執行,繞不過去。
+#
+# ⚠ 前提:叢集的 CNI 必須支援 NetworkPolicy(Calico、Cilium 等)。
+#   Flannel 預設不支援 —— 套用會成功但完全不生效,給你錯誤的安全感。
+#   先確認:kubectl get networkpolicy 有列出,且實測私網位址真的被擋。
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: crawl4ai-isolation
+spec:
+  podSelector:
+    matchLabels: { app: crawl4ai }
+  policyTypes: [Ingress, Egress]
+
+  ingress:
+    # 只接受來自 webgw 的連線。叢集內其他 Pod 一律拒絕。
+    - from:
+        - podSelector:
+            matchLabels: { app: webgw }
+      ports:
+        - port: 11235
+          protocol: TCP
+
+  egress:
+    # DNS 必須放行,否則什麼網域都解析不了。
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+    # 對外爬取:允許整個網際網路,但排除所有私有網段。
+    # 這一條讓「公開網址 302 轉址到內網」這類攻擊在網路層就失效 ——
+    # 即使應用層的檢查有漏,封包也出不去。
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8        # RFC1918 (通常也含叢集的 Pod/Service 網段)
+              - 172.16.0.0/12     # RFC1918
+              - 192.168.0.0/16    # RFC1918
+              - 169.254.0.0/16    # link-local,含雲端 metadata 169.254.169.254
+              - 127.0.0.0/8       # loopback
+              - 100.64.0.0/10     # CGNAT,部分雲端內部服務使用
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: webgw-egress
+spec:
+  podSelector:
+    matchLabels: { app: webgw }
+  policyTypes: [Egress]
+  egress:
+    # webgw 只需要連 crawl4ai 和 DNS。它自己從不直接對外抓網頁。
+    - to:
+        - podSelector:
+            matchLabels: { app: crawl4ai }
+      ports:
+        - port: 11235
+          protocol: TCP
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

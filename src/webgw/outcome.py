@@ -26,6 +26,7 @@ TIMEOUT = "timeout"
 FETCH_FAILED = "fetch_failed"
 BLOCKED_URL = "blocked_url"
 BLOCKED_REDIRECT = "blocked_redirect"
+RATE_LIMITED = "rate_limited"
 
 # 低於此長度視為沒有實質內容。
 # 校準依據:Reuters 被 DataDome 擋時 raw_markdown 只有 1 個字元;
@@ -33,7 +34,7 @@ BLOCKED_REDIRECT = "blocked_redirect"
 # 取 50:足以分辨「幾乎什麼都沒有」與「小但真實」。
 MIN_CONTENT_CHARS = 50
 
-RETRYABLE = {TIMEOUT, FETCH_FAILED}
+RETRYABLE = {TIMEOUT, FETCH_FAILED, RATE_LIMITED}
 
 _HINTS = {
     BLOCKED_ANTIBOT: "站台以反爬機制阻擋。重試不會成功 (實測同一頁連打 4 次全被擋),請改用其他來源。",
@@ -45,6 +46,7 @@ _HINTS = {
     FETCH_FAILED: "無法連上上游抓取服務。",
     BLOCKED_URL: "目的地不允許存取。不要改寫 URL 嘗試繞過。",
     BLOCKED_REDIRECT: "轉址後的落點不在允許範圍內,結果已丟棄。",
+    RATE_LIMITED: "請求過於頻繁,已達速率上限。稍後再試,或降低呼叫頻率。",
 }
 
 
