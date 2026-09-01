@@ -64,12 +64,23 @@ spec:
     matchLabels: { app: webgw }
   policyTypes: [Egress]
   egress:
-    # webgw 只需要連 crawl4ai 和 DNS。它自己從不直接對外抓網頁。
+    # webgw 只需要連 crawl4ai、重排服務和 DNS。它自己從不直接對外抓網頁。
     - to:
         - podSelector:
             matchLabels: { app: crawl4ai }
       ports:
         - port: 11235
+          protocol: TCP
+    # 重排服務。務必用**叢集內的 Service**,不要用公開的 ingress ——
+    # 走 ingress 會被這條 NetworkPolicy 擋掉(實測:連線掛住直到 15 秒逾時,
+    # 降級為 bm25),而且那是 Pod -> 出叢集 -> DNS -> 再從 ingress 進來的繞路。
+    #
+    # 對應 ConfigMap 的 RERANKER_URL 要改成 http://<reranker-service>:8000
+    - to:
+        - podSelector:
+            matchLabels: { app: bge-reranker-v2-m3-vllm }   # <- 改成你的 reranker Pod 標籤
+      ports:
+        - port: 8080
           protocol: TCP
     - to:
         - namespaceSelector: {}

@@ -30,11 +30,25 @@ spec:
     metadata:
       labels: { app: crawl4ai }
     spec:
+      # 關掉 k8s 自動注入的 Service 環境變數。
+      #
+      # k8s 沿用 Docker 早期行為:namespace 裡每有一個 Service,就替每個 Pod
+      # 注入一組 <SERVICE_NAME>_PORT 之類的變數。Service 叫 crawl4ai 時會注入
+      #   CRAWL4AI_PORT=tcp://10.x.x.x:11235
+      # 而 crawl4ai 這支程式自己也用 CRAWL4AI_PORT 決定監聽埠 —— 被蓋掉之後
+      # gunicorn 拿這個 URL 當埠號解析,啟動即崩潰:
+      #   Error: 'tcp://10.105.110.45:11235' is not a valid port number.
+      #
+      # 這只影響環境變數注入,DNS 不受影響 —— http://crawl4ai:11235 照常可用。
+      enableServiceLinks: false
       containers:
         - name: crawl4ai
-          # 用 digest 而非 :latest —— 標籤會被覆寫,digest 不會。
-          # 這個 digest 對應 C4AI_VERSION=0.9.2。
-          image: unclecode/crawl4ai@sha256:bd36741e7bdd35ddc1a05d9183e1d6d8cefb61dd640d944a25d026b76e917690
+          # 標籤 + digest 兩個都寫:標籤負責可讀性,digest 負責不可變。
+          # 實際拉取以 digest 為準,標籤被重新發布也不受影響。
+          #
+          # 不要只寫 :latest —— 實測 2026-09-01 時 :latest 已經從這個 digest
+          # 移動到 sha256:84751dab...,寫 :latest 會拉到未經測試的版本。
+          image: unclecode/crawl4ai:0.9.2
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 11235
@@ -53,18 +67,29 @@ spec:
             # docker run 用 --shm-size=1g,k8s 要靠這個 emptyDir 達成。
             - name: dshm
               mountPath: /dev/shm
+          # startupProbe 專門給啟動慢的容器。在它通過之前,readiness 與 liveness
+          # 都不會作用 —— 這樣既給足啟動時間,又不必放寬 liveness 的閾值
+          # (放寬會讓真正掛掉時的偵測變慢)。
+          #
+          # crawl4ai 的啟動流程:redis -> gunicorn -> 建立 Playwright 瀏覽器池
+          # (日誌會出現「Creating permanent default browser」)。冷啟動可能要一兩分鐘。
+          # 30 次 x 10 秒 = 最多容忍 5 分鐘。
+          startupProbe:
+            httpGet: { path: /health, port: 11235 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 30
           readinessProbe:
             # 從 Pod IP 打,不是從容器內 localhost 打 —— 這點很重要:
             # 映像自帶的 HEALTHCHECK 是內部 curl localhost,服務只綁 loopback
             # 時它照樣通過。k8s 探針從外部打,才驗得到真正的可達性。
             httpGet: { path: /health, port: 11235 }
-            initialDelaySeconds: 20
             periodSeconds: 10
             failureThreshold: 3
           livenessProbe:
             httpGet: { path: /health, port: 11235 }
-            initialDelaySeconds: 60
             periodSeconds: 30
+            failureThreshold: 3
           resources:
             requests: { cpu: "500m", memory: "2Gi" }
             # 映像的健康檢查會在可用記憶體 < 2GB 時警告。

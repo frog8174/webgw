@@ -29,12 +29,14 @@ class Config:
     host: str = os.environ.get("GATEWAY_HOST", "0.0.0.0")
     port: int = _int("GATEWAY_PORT", 8080)
 
-    # 選節預算。實測 (12 查詢 / 3 頁面):4000 tok 命中 12/12,2000 tok 命中 11/12。
-    select_budget_tokens: int = _int("SELECT_BUDGET_TOKENS", 4000)
+    # 選節預算。實測台積電那頁 (92k tokens):4000 ✗、6000 ✗、8000 ✓。
+    # 不用百分比 —— 地端模型 context 只有 8k~32k,百分比遇到超大頁面會爆掉。
+    select_budget_tokens: int = _int("SELECT_BUDGET_TOKENS", 8000)
     # 小於此值的頁面直接回傳全文,不做選節 —— 省下的 token 不值得冒砍錯的風險。
     passthrough_max_tokens: int = _int("PASSTHROUGH_MAX_TOKENS", 4000)
-    # 單一章節最多佔預算的比例。防止超大章節(如 OpenReview 的 21k tok 單節)炸掉預算。
-    max_section_frac: float = _float("MAX_SECTION_FRAC", 0.5)
+    # 單一章節最多佔預算的比例。0.5 時實測有一次只裝進 1 個段落就用完預算,
+    # 降到 0.35 能塞進至少 3 個不同段落,覆蓋面明顯較好。
+    max_section_frac: float = _float("MAX_SECTION_FRAC", 0.35)
 
     fetch_timeout_s: float = _float("FETCH_TIMEOUT_S", 30.0)
 
@@ -45,6 +47,19 @@ class Config:
     # 客戶端開的 GET /mcp SSE 串流沒有 session 可依附 —— 實測 OpenCode 會
     # 因此取不到工具清單。預設關閉:反正快取是 SQLite 單檔、replicas 鎖在 1,
     # stateless 目前買不到水平擴展。要擴展時再連同快取後端一起改。
+    # ── 檢索 ────────────────────────────────────────────────────────
+    # bm25 (預設,約 2.5 秒) | rerank (約 5~8 秒)
+    # 實測 30 個 ground-truth 案例:bm25 rank@1 24/30,rerank 28/30。
+    # 沒有 auto 模式 —— 實驗證明沒有訊號能預測 BM25 何時會錯,見 retrieval.py。
+    retrieval_mode: str = os.environ.get("RETRIEVAL_MODE", "bm25")
+    reranker_url: str = os.environ.get("RERANKER_URL", "")
+    reranker_model: str = os.environ.get("RERANKER_MODEL", "bge-reranker-v2-m3")
+    rerank_top_n: int = _int("RERANK_TOP_N", 30)
+    rerank_timeout_s: float = _float("RERANK_TIMEOUT_S", 15.0)
+    # 單段送出的字元上限。cross-encoder 把 query 和 document 接在一起送,
+    # 超過模型 max_model_len 的部分會被截掉,可能截掉答案所在處。
+    rerank_doc_chars: int = _int("RERANK_DOC_CHARS", 2000)
+
     # ── 限流 ────────────────────────────────────────────────────────
     # 上游 crawl4ai 自己沒有任何限流 (啟動日誌:work queue per_principal=unlimited),
     # 而每次抓取都會開一個真實瀏覽器分頁,是重負載。

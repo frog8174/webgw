@@ -1,7 +1,7 @@
 services:
   webgw:
     build: .
-    image: webgw:0.2.0
+    image: webgw:0.3.0
     container_name: webgw
     ports:
       # 本機測試綁 loopback。上線時由 k8s Service (NodePort) 處理對外暴露,

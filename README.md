@@ -11,11 +11,30 @@ agent 接上地端模型使用。上游是自架的 crawl4ai。
 
 本工具用 BM25 依 query 選出相關章節的**逐字原文**。實測 (12 查詢 / 3 頁面):
 
-| 預算 | BM25 (有 query) | 密度啟發式 | 文件順序 |
-|---|---|---|---|
-| 2,000 tok | 11/12 | 1/12 | 1/12 |
-| 4,000 tok | **12/12** | 1/12 | 3/12 |
-| 8,000 tok | 12/12 | 5/12 | 10/12 |
+| 設定 | rank@1 | 額外成本 |
+|---|---|---|
+| BM25 | 21/30 | — |
+| BM25 + 繁簡正規化 | **24/30** | +145ms |
+| 再加上 cross-encoder 重排 | **28/30** | +3,000ms |
+
+（30 個 ground-truth 案例:12 英文 + 18 中文）
+
+
+## 檢索模式
+
+```
+mode="bm25"    預設。關鍵詞比對 + 繁簡正規化。約 2~3 秒。
+mode="rerank"  BM25 取前 30 名 -> cross-encoder 重排。約 5~8 秒。
+```
+
+**沒有 auto 模式。** 原本想做「BM25 沒把握時才重排」,但六個候選訊號
+(有分數段落佔比、最高分、分數差距、查詢詞覆蓋率、前 3 名集中度、段落總數)
+在正確組與錯誤組之間**全部重疊**。最極端的反例:`can I still build with Bazel`
+分數差距 2.09、信心 high、查詢詞覆蓋率 1.00,而 BM25 把它排第 19。
+
+BM25 的分數只說明它有多確定,不說明它對不對 —— 而錯得很確定正是要抓的情況。
+所以決定權交給呼叫端:先用 bm25,沒找到再用 `mode="rerank"` 重試同一頁。
+**raw 已快取,重試不重爬,只付重排的時間。**
 
 ## 設計上的實測依據
 
@@ -25,19 +44,22 @@ agent 接上地端模型使用。上游是自架的 crawl4ai。
   標題卻留下登入元件 (TechNews 的 outline 從 9 節掉到 2 節)。
 - **沒有 query 時用文件順序截斷,不做密度過濾** — 密度在每個預算下都輸給單純截斷。
 - **不維護 chrome 黑名單** — 導覽列不含查詢詞,BM25 分數為 0 自然出局。
+- **繁簡要正規化** — 繁體查詢對簡體內容時,實測全頁 21 節只有「参考文献」
+  偶然得分,選出來的是一整頁參考文獻條目。正規化後 14/21 節有分數,正解排第一。
 - **PDF 在准入層擋掉** — 實測會讓上游硬崩潰 (`Page.goto: Download is starting`)。
 - **404 需自行判定** — 上游對 GitHub 404 回 `success=True` 加完整錯誤頁 2,434 tokens。
 
 ## 映像
 
 ```
-docker pull abc99012/webgw:0.2.0
+docker pull abc99012/webgw:0.3.0
 ```
 
-digest `sha256:baf6e1b1a5dec9a997660441e8f2ef0a8020ea5fbb2e91e21f01bf9440a75558`
+digest `sha256:7a5795155c1078ab37607135dda19c17937f593aaba95b737b7b2631fc63c6e6`
 
 > 版本沿革
-> - **0.2.0** — 加入 Bearer token 認證、併發/速率限制、`GET /mcp` 回 405
+> - **0.3.0** — 繁簡正規化、cross-encoder 重排(選用)、預算 8000、match 訊號取代 query_matched
+> - 0.2.0 — Bearer token 認證、併發/速率限制、`GET /mcp` 回 405
 > - 0.1.1 — 修正 stateless 預設開啟導致客戶端取不到工具清單
 > - 0.1.0 — 有上述 stateless bug,不要使用
 
@@ -81,6 +103,12 @@ curl http://127.0.0.1:8080/healthz
 | `PASSTHROUGH_MAX_TOKENS` | `4000` | 小於此值直接回全文 |
 | `FETCH_TIMEOUT_S` | `30` | 抓取逾時 |
 | `MCP_STATELESS` | `0` | 保持關閉。開啟會讓客戶端取不到工具清單 |
+| `SELECT_BUDGET_TOKENS` | `8000` | 選節預算。實測 92k 頁面 4000 ✗、6000 ✗、8000 ✓ |
+| `MAX_SECTION_FRAC` | `0.35` | 單節上限佔預算比例。0.5 時曾只裝進 1 個段落 |
+| `RETRIEVAL_MODE` | `bm25` | 預設檢索模式 |
+| `RERANKER_URL` | — | 留空則停用重排;`mode="rerank"` 會自動降級為 bm25 |
+| `RERANKER_MODEL` | `bge-reranker-v2-m3` | vLLM 的 served-model-name |
+| `RERANK_TOP_N` | `30` | 送給重排的候選數。不對整頁重排 |
 | `WEBGW_AUTH_TOKEN` | — | Bearer token。**留空時強制只綁 127.0.0.1** |
 | `MAX_CONCURRENT_FETCHES` | `4` | 同時抓取上限,超過排隊 |
 | `RATE_LIMIT_PER_MINUTE` | `60` | 每分鐘請求上限,0 = 不限 |
@@ -113,9 +141,9 @@ SSRF 防護(阻擋私網/loopback/link-local、轉址後重驗、PDF 等二進�
 
 ## 尚未實作
 
-- raw markdown 快取層 (目前每次請求都重抓)
-- 小模型預讀層 — 先驗證主模型能否直接從 BM25 原文段落作答,再決定是否需要
-- 中文選節的充分驗證 — 目前只有 1 個中文案例,CJK 用 bigram 代替分詞
+- 重排結果的快取 (目前同一頁同一查詢重試會重新付重排成本)
+- `auto` 模式 — 需要能預測 BM25 失敗的訊號,目前六個候選全部無效
+- 預設模式的取捨 — 要用真實使用資料決定要不要把預設改成 rerank
 =======
 # crawl-gateway
 

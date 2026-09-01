@@ -31,7 +31,7 @@ data:
   CRAWL4AI_BASE_URL: "http://crawl4ai:11235"
   GATEWAY_HOST: "0.0.0.0"
   GATEWAY_PORT: "8080"
-  SELECT_BUDGET_TOKENS: "4000"
+  SELECT_BUDGET_TOKENS: "8000"
   PASSTHROUGH_MAX_TOKENS: "4000"
   FETCH_TIMEOUT_S: "30"
   # 改成你的節點 IP 與 nodePort。可列多個,逗號分隔。
@@ -45,6 +45,17 @@ data:
   # stateless 會讓客戶端取不到工具清單(實測 OpenCode),保持關閉。
   MCP_STATELESS: "0"
   MAX_CONCURRENT_FETCHES: "4"
+  # 檢索:bm25(快,約 2.5s) | rerank(準,約 5~8s)。
+  # 實測 30 案例 rank@1:bm25 24/30、rerank 28/30。
+  # 沒有 auto 模式 —— 實驗證明沒有訊號能預測 BM25 何時會錯。
+  RETRIEVAL_MODE: "bm25"
+  # 用叢集內的 Service,不要用公開 ingress —— 走 ingress 會被 NetworkPolicy
+  # 擋掉,且是 Pod -> 出叢集 -> 再進來的繞路。改成你的 reranker Service 名稱。
+  RERANKER_URL: "http://bge-reranker:8000"
+  RERANKER_MODEL: "bge-reranker-v2-m3"
+  RERANK_TOP_N: "30"
+  RERANK_TIMEOUT_S: "15"
+  MAX_SECTION_FRAC: "0.35"
   RATE_LIMIT_PER_MINUTE: "60"
 ---
 apiVersion: v1
@@ -72,11 +83,35 @@ spec:
     metadata:
       labels: { app: webgw }
     spec:
+      # 關掉 k8s 自動注入的 Service 環境變數。
+      #
+      # k8s 沿用 Docker 早期行為:namespace 裡每有一個 Service,就替每個 Pod
+      # 注入一組 <SERVICE_NAME>_PORT 之類的變數。Service 叫 crawl4ai 時會注入
+      #   CRAWL4AI_PORT=tcp://10.x.x.x:11235
+      # 而 crawl4ai 這支程式自己也用 CRAWL4AI_PORT 決定監聽埠 —— 被蓋掉之後
+      # gunicorn 拿這個 URL 當埠號解析,啟動即崩潰:
+      #   Error: 'tcp://10.105.110.45:11235' is not a valid port number.
+      #
+      # 這只影響環境變數注入,DNS 不受影響 —— http://crawl4ai:11235 照常可用。
+      enableServiceLinks: false
+      # fsGroup 必須放在 Pod 層 —— 容器層的 securityContext 沒有這個欄位。
+      #
+      # PVC 掛上來時擁有者是 root,而容器以 uid 10001 執行,預設寫不進去:
+      #   sqlite3.OperationalError: unable to open database file
+      #
+      # fsGroup 會讓 kubelet 把掛載卷的群組改成這個值並加上 setgid,
+      # 非 root 的行程才寫得進去。
+      #
+      # 注意:Docker 的具名卷會沿用映像裡該目錄的擁有者,所以本機 compose 測不出這個問題。
+      # k8s 的 PVC 不會,它直接蓋掉映像裡的目錄權限。
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
       containers:
         - name: webgw
-          # 已推送至 Docker Hub。若要固定版本,改用 digest:
-          #   abc99012/webgw@sha256:baf6e1b1a5dec9a997660441e8f2ef0a8020ea5fbb2e91e21f01bf9440a75558
-          image: abc99012/webgw:0.2.0
+          # 標籤 + digest:標籤可讀,digest 保證拉到的是這一個。
+          image: abc99012/webgw:0.3.0@sha256:7a5795155c1078ab37607135dda19c17937f593aaba95b737b7b2631fc63c6e6
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -104,8 +139,6 @@ spec:
             requests: { cpu: "50m",  memory: "128Mi" }
             limits:   { cpu: "500m", memory: "512Mi" }
           securityContext:
-            runAsNonRoot: true
-            runAsUser: 10001
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true   # /data 是掛載卷,可寫
             capabilities: { drop: ["ALL"] }
