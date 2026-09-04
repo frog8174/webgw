@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Two-pass retrieval demo. Standard library only -- no pip install.
 
-Calls a live webgw over MCP streamable HTTP and prints the part that matters:
-what BM25 ranked first, and what the reranker ranked first on the same page.
+Calls a live webgw over MCP streamable HTTP and shows what each mode actually
+returned, then checks the returned text for the terms any correct answer to the
+query has to contain. Section titles alone prove nothing; the check is the point.
 
     WEBGW_URL=https://... WEBGW_TOKEN=... python3 demo.py
 
@@ -23,15 +24,19 @@ PROTOCOL = "2025-11-25"
 PAGE = "https://en.wikipedia.org/wiki/Transformer_(deep_learning_architecture)"
 QUERY = "how does multi-head attention work"
 
+# Terms an explanation of the mechanism has to use. Checked against the text
+# actually returned -- this is what makes the demo evidence rather than a claim.
+MUST = ["query", "key", "value", "softmax", "dot-product", "concaten"]
+
 B, DIM, OFF = "\033[1m", "\033[2m", "\033[0m"
-CYAN, GREEN, YELLOW = "\033[36m", "\033[32m", "\033[33m"
+CYAN, GREEN, YELLOW, RED = "\033[36m", "\033[32m", "\033[33m", "\033[31m"
 
 _session: str | None = None
 
 
 def rpc(method: str, params: dict | None = None, notify: bool = False) -> dict:
     global _session
-    body = {"jsonrpc": "2.0", "method": method}
+    body: dict = {"jsonrpc": "2.0", "method": method}
     if not notify:
         body["id"] = 1
     if params is not None:
@@ -55,8 +60,7 @@ def rpc(method: str, params: dict | None = None, notify: bool = False) -> dict:
         raw = r.read().decode()
     if not raw.strip():
         return {}
-    # MCP_JSON_RESPONSE=1 gives plain JSON; tolerate SSE framing anyway.
-    if raw.startswith("event:") or raw.startswith("data:"):
+    if raw.startswith(("event:", "data:")):
         for line in raw.splitlines():
             if line.startswith("data:"):
                 raw = line[5:].strip()
@@ -64,29 +68,39 @@ def rpc(method: str, params: dict | None = None, notify: bool = False) -> dict:
     return json.loads(raw)
 
 
-def fetch(mode: str) -> tuple[dict, int]:
+def fetch(mode: str) -> tuple[dict, float]:
     t0 = time.time()
     out = rpc("tools/call", {"name": "web_fetch",
                              "arguments": {"url": PAGE, "query": QUERY, "mode": mode}})
-    ms = int((time.time() - t0) * 1000)
     res = out.get("result", {})
     data = res.get("structuredContent") or res.get("structured_content")
     if data is None:
         data = json.loads(res["content"][0]["text"])
-    return data, ms
+    return data, time.time() - t0
 
 
-def show(label: str, d: dict, ms: int) -> None:
+def show(mode: str, d: dict, secs: float) -> None:
     m = d.get("match") or {}
-    top = (d.get("excerpts") or [{}])[0].get("title", "?")
     conf = m.get("confidence", "?")
-    colour = GREEN if conf == "high" else YELLOW
-    print(f"  {B}{label:<16}{OFF}"
-          f"{d['raw_tokens']:>7,} -> {B}{d['returned_tokens']:>6,}{OFF} tokens"
-          f"   {colour}{conf:<6}{OFF}"
-          f" {DIM}({m.get('top_score')}){OFF}"
-          f"   cache={d.get('cache')}   {ms/1000:.1f}s")
-    print(f"  {DIM}{'':<16}top section:{OFF} {CYAN}{top}{OFF}\n")
+    ccol = GREEN if conf == "high" else YELLOW
+    print(f"  {B}mode={mode:<7}{OFF}{DIM}->{OFF} {B}{d['returned_tokens']:>5,}{OFF} tok"
+          f"   {ccol}{conf:<6}{OFF}{DIM}({m.get('top_score')}){OFF}   {secs:.1f}s")
+
+    joined = " ".join(e["text"] for e in d.get("excerpts") or []).lower()
+    for i, e in enumerate(d.get("excerpts") or [], 1):
+        hit = any(t in e["text"].lower() for t in MUST)
+        mark = f"{GREEN}*{OFF}" if hit else " "
+        print(f"   {mark}{i} {e['title'][:34]:<36}{DIM}{e['tokens']:>5,} tok{OFF}")
+
+    found = [t for t in MUST if t in joined]
+    if len(found) >= 4:
+        verdict, col = "answerable", GREEN
+    elif found:
+        verdict, col = "partial", YELLOW
+    else:
+        verdict, col = "NOT answerable", RED
+    print(f"     {DIM}mechanism terms:{OFF} {col}{', '.join(found) or 'none'}"
+          f"  -> {verdict}{OFF}\n")
 
 
 def main() -> int:
@@ -94,21 +108,15 @@ def main() -> int:
                        "clientInfo": {"name": "demo", "version": "1"}})
     rpc("notifications/initialized", notify=True)
 
-    print(f"\n  {DIM}page {OFF}{PAGE.split('/wiki/')[-1].replace('_', ' ')}")
+    a, sa = fetch("bm25")
+    print(f"\n  {DIM}page {OFF}Transformer (deep learning)   "
+          f"{B}{a['raw_tokens']:,}{OFF}{DIM} tokens raw{OFF}")
     print(f"  {DIM}query{OFF} {B}{QUERY}{OFF}\n")
-
-    a, ms_a = fetch("bm25")
-    show("mode=bm25", a, ms_a)
-    b, ms_b = fetch("rerank")
-    show("mode=rerank", b, ms_b)
-
-    cut = 100 - b["returned_tokens"] * 100 // b["raw_tokens"]
-    print(f"  {DIM}Same page, same query. The reranker found the section that is"
-          f" actually{OFF}")
-    print(f"  {DIM}about the mechanism -- and cache={b.get('cache')} means the retry"
-          f" never re-crawled.{OFF}")
-    print(f"  {DIM}Either way the page shrank by{OFF} {B}{cut}%{OFF}"
-          f"{DIM}, and every passage is verbatim.{OFF}\n")
+    show("bm25", a, sa)
+    b, sb = fetch("rerank")
+    show("rerank", b, sb)
+    print(f"  {DIM}Same page, same query. cache={b.get('cache')} -- the retry never"
+          f" re-crawled.{OFF}")
     return 0
 
 

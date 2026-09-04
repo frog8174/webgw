@@ -13,10 +13,11 @@ summary — so a model with an 8k context can read a 90k-token page.
 
 ![webgw reading a 90k-token page twice: BM25 first, then the reranker](demo/demo.gif)
 
-*A real recording, not a mock-up. Same page, same query, two retrieval modes.
-`cache=hit` shows the retry never re-crawled. What the two modes actually
-returned is worth reading — see [below](#the-two-pass-workflow-on-one-page).
-Regenerate with [`demo/demo.tape`](demo/demo.tape).*
+*A real recording against a live 0.3.3, not a mock-up. The demo checks the
+returned text for the terms a correct answer must contain and prints its own
+verdict — `partial` for BM25, `answerable` after reranking — so the recording is
+evidence rather than a claim. Regenerate with
+[`demo/demo.tape`](demo/demo.tape).*
 
 ## Use it if
 
@@ -88,18 +89,18 @@ correct section ranked first.*
 
 ## What it actually does
 
-Real calls against a deployed instance, 2026-09-04. Every number below is
+Real calls against a deployed **0.3.3**, 2026-09-04. Every number below is
 measured, not illustrative.
 
 | Case | `outcome` | raw → returned | `mode` | confidence | time |
 |---|---|---|---|---|---|
-| Small page, no query | `ok` | 33 → 33 | `passthrough` | — | — |
-| Large page + query | `ok` | 89,847 → **6,353** | `bm25` | medium | 0.7 s |
-| Same page, `mode="rerank"` | `ok` | 89,847 → **7,000** | `rerank` | **high** | 8.3 s |
-| Traditional query, Simplified page | `ok` | 52,196 → **5,263** | `bm25` | medium | 1.7 s |
-| GitHub 404 | `not_found` | — | — | — | 2.7 s |
-| arXiv PDF | `unsupported_content` | — | — | — | **10 ms** |
-| Cloud metadata IP | `blocked_url` | — | — | — | **10 ms** |
+| Small page, no query | `ok` | 33 → 33 | `passthrough` | — | 0.4 s |
+| Large page + query | `ok` | 89,847 → **6,317** | `bm25` | medium (5.45) | 1.2 s |
+| Same page, `mode="rerank"` | `ok` | 89,847 → **7,000** | `rerank` | **high** (0.97) | 6.7 s |
+| Traditional query, Simplified page | `ok` | 52,196 → **5,263** | `bm25` | medium (10.72) | 1.1 s |
+| GitHub 404 | `not_found` | — | — | — | 3.4 s |
+| arXiv PDF | `unsupported_content` | — | — | — | **11 ms** |
+| Cloud metadata IP | `blocked_url` | — | — | — | **12 ms** |
 | Query matches nothing | `ok` | 9,012 → 7,704 | `document_order` | none | 0.3 s |
 
 *Fetch times are with a warm cache; a cold fetch of a large page is 2–6 s. The
@@ -125,30 +126,34 @@ answer (`k1 ∈ [1.2, 2.0]`, `b = 0.75`) is intact and quotable.
 Same URL, same query — `how does multi-head attention work` on the Transformer
 article (89,847 raw tokens):
 
-| | top 5 sections returned | confidence |
-|---|---|---|
-| `mode="bm25"` | Subsequent work · Transformer (interlanguage links) · FlashAttention · Parallelizing attention · Tokenization | medium (5.53) |
-| `mode="rerank"` | Multi-Query Attention · **Multihead attention** · Encoder · Methods for stabilizing training · **Attention head** | high (0.97) |
+Section titles prove nothing on their own, so the check is against the returned
+**text**: does it contain the terms any explanation of the mechanism must use —
+query, key, value, softmax, dot-product, concatenation?
 
-Read the contents, not the headline. BM25's first pick was a **36-token section
-whose entire body is an `[edit]` link**, and its second was 2,800 tokens of
-interlanguage links — 45% of that budget was chrome. `Attention head` and
-`Multihead attention`, which actually answer the question, were pushed out.
+| | sections returned | mechanism terms found | verdict |
+|---|---|---|---|
+| `mode="bm25"` | Transformer (interlanguage links) · FlashAttention · Parallelizing attention · Tokenization | query, key, dot-product | **partial** |
+| `mode="rerank"` | Multi-Query Attention · **Multihead attention** · Encoder · Methods for stabilizing training · **Attention head** | query, key, value, softmax, dot-product, concatenation | **answerable** |
 
-Reranking recovered both. Its top pick, *Multi-Query Attention*, is a variant
-rather than the explanation — the value is that the answer is now **in the five**,
-not that position 1 is perfect. `Attention head` at position 5 carries every term
-the mechanism needs: query, key, value, softmax, scaled dot-product, attention
-weight.
+BM25 returns text that mentions attention without ever explaining it. Reranking
+brings back `Multihead attention` and `Attention head`, and the answer becomes
+reconstructable from the passages alone.
+
+Note what the rerank column does *not* say: its top pick, *Multi-Query Attention*,
+is a variant rather than the explanation. The value is that the answer is **in the
+five at all**, not that position 1 is perfect.
 
 Because raw content is cached, the retry cost only the reranking, not another
 crawl.
 
-> Measured on **0.3.2**. The chrome BM25 returned was a bug — a section admitted
-> on its raw token count while carrying no prose — fixed in 0.3.3 and pinned by
-> [`bench/`](bench/). The rerank column is unaffected. The table and the recording
-> above still show 0.3.2 behaviour and will be re-measured after the fix is
-> deployed.
+> **A limitation this exposes.** BM25's first pick is still 2,800 tokens of
+> interlanguage links — 44% of its budget. 0.3.3 fixed a related bug (a section
+> whose whole body was an `[edit]` link ranked first) and dropped 3 such sections
+> from this page, but it moved chrome from 44.6% to only 44.3%, because the
+> section that dominates is **mixed**: crawl4ai emits the navigation block and the
+> article lead as one unbroken region with no heading between them, so it cannot
+> be dropped without losing the lead. Splitting it is not solved. Reranking sees
+> past it; BM25 does not.
 
 ### Where it does not help much
 
@@ -556,6 +561,10 @@ uv run python scripts/check.py --full    # includes real fetches
   hermetically and runs in the test suite, but it does not reproduce the
   30-case and 17-case figures quoted above; those sets were never committed.
   Until they are, treat those numbers as the author's measurements
+- **Splitting the navigation-plus-lead block** — crawl4ai emits a page's chrome
+  and its opening prose as one region with no heading between them. It cannot be
+  dropped without losing the lead, and on Wikipedia it is ~2,800 tokens that BM25
+  ranks first. Reranking is currently the only thing that sees past it
 - Caching of rerank results — the same page with the same query pays the rerank
   cost again
 - An `auto` mode — needs a signal that predicts BM25 failure; all six candidates
@@ -588,7 +597,10 @@ Image: `abc99012/webgw:0.3.3`
 - **0.3.3** — section admission measures the link-stripped body, not the raw one.
   A section containing only an `[edit]` link cleared the raw-token threshold and,
   with BM25's short-document boost, could rank first on a one-word title match.
-  Adds [`bench/`](bench/), which pins this and runs in the test suite
+  Adds [`bench/`](bench/), which pins this and runs in the test suite.
+  Measured effect on the Transformer article: 3 link-only sections dropped,
+  chrome 44.6% -> 44.3% of the returned budget. The narrow bug is fixed; the
+  mixed navigation-plus-lead block that dominates it is not
 - 0.3.2 — `RERANKER_API_KEY`, so a commercial rerank endpoint (Cohere, Jina,
   Voyage) works as well as a self-hosted one; tool description and all source
   comments in English
