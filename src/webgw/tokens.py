@@ -1,8 +1,10 @@
-"""Token 計數。
+"""Token counting.
 
-用 tiktoken cl100k_base 當預算代理。地端模型(Qwen/Llama)的 tokenizer 不同,
-所以這是近似值而非精確值 —— 對「選節預算」這個用途足夠,不要當成精確計費。
-容器建置時已預先快取編碼檔,執行期不需連外。
+Uses tiktoken's cl100k_base as a budget proxy. Local models (Qwen, Llama) ship
+different tokenizers, so this is an approximation rather than an exact count --
+good enough for deciding how much text fits in a selection budget, but do not
+treat it as precise billing. The encoding file is pre-cached at image build
+time, so no outbound network access is needed at runtime.
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ def count(text: str | None) -> int:
 
 
 def truncate(text: str, max_tokens: int) -> str:
-    """截到指定 token 數。回傳的是可解碼的完整字串。"""
+    """Cut to the given token count, returning a fully decodable string."""
     if max_tokens <= 0:
         return ""
     enc = _encoder()

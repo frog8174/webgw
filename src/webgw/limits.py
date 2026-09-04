@@ -1,12 +1,14 @@
-"""併發與速率限制。
+"""Concurrency and rate limiting.
 
-為什麼需要:上游 crawl4ai 啟動時會記錄 `work queue (per_principal=unlimited)`,
-它自己沒有任何限流。而每次 web_fetch 都會開一個真實的瀏覽器分頁 —— 那是
-記憶體與 CPU 的重負載。沒有上限的話,幾個並發請求就能把上游拖垮。
+Why this is needed: upstream crawl4ai logs `work queue (per_principal=unlimited)`
+at startup -- it applies no throttling of its own. Every web_fetch opens a real
+browser tab, which is a heavy memory and CPU load. Without a ceiling, a handful
+of concurrent requests is enough to take the upstream down.
 
-兩層分開處理,因為它們防的是不同的事:
-  併發上限  同一時間最多幾個抓取在跑 —— 保護上游的資源
-  速率上限  每個來源每分鐘最多幾次請求 —— 防止單一客戶端佔滿配額
+The two layers are separate because they guard against different things:
+    concurrency  how many fetches run at once -- protects upstream resources
+    rate         requests per minute per caller -- stops one client from
+                 consuming the whole quota
 """
 from __future__ import annotations
 
@@ -16,10 +18,11 @@ from collections import defaultdict, deque
 
 
 class ConcurrencyLimiter:
-    """限制同時進行的抓取數量。
+    """Caps how many fetches run at the same time.
 
-    用 asyncio.Semaphore:超過上限的請求會排隊等待,而不是被拒絕 ——
-    抓取本來就慢(實測 0.3~21 秒),多等一下比直接失敗對 agent 有用得多。
+    Backed by asyncio.Semaphore, so requests over the limit queue up instead of
+    being rejected. Fetching is inherently slow (measured 0.3-21 seconds), so
+    waiting a little is far more useful to an agent than an outright failure.
     """
 
     def __init__(self, limit: int) -> None:
@@ -37,10 +40,12 @@ class ConcurrencyLimiter:
 
 
 class RateLimiter:
-    """每個來源在滑動視窗內的請求數上限。
+    """Per-caller request ceiling over a sliding window.
 
-    滑動視窗(sliding window):記錄每次請求的時間戳,只保留視窗內的,
-    數量超過上限就拒絕。比固定視窗準確 —— 固定視窗在邊界處可以擠進兩倍流量。
+    Sliding window: timestamps of each request are kept, old ones outside the
+    window are dropped, and the request is refused once the count exceeds the
+    limit. More accurate than a fixed window, which lets twice the traffic
+    through at a window boundary.
     """
 
     def __init__(self, max_requests: int, window_s: float = 60.0) -> None:
@@ -62,14 +67,14 @@ class RateLimiter:
         return True
 
     def retry_after_s(self, key: str) -> int:
-        """還要等幾秒才會有額度。用來給呼叫方明確的等待時間。"""
+        """Seconds until quota frees up, so the caller gets a concrete wait."""
         hits = self._hits.get(key)
         if not hits:
             return 0
         return max(1, int(self.window_s - (time.monotonic() - hits[0])) + 1)
 
     def prune(self) -> None:
-        """清掉沒有近期活動的來源,避免長時間執行後字典無限成長。"""
+        """Drop callers with no recent activity so the dict cannot grow forever."""
         cutoff = time.monotonic() - self.window_s
         for key in [k for k, v in self._hits.items() if not v or v[-1] < cutoff]:
             self._hits.pop(key, None)

@@ -1,9 +1,9 @@
-"""選節演算法。固定住實測出來的行為。
+"""Selection algorithm. Pins down the behaviour that measurement settled on.
 
-實測依據 (30 個 ground-truth 案例):
-    BM25            rank@1 21/30
-    BM25 + t2s      rank@1 24/30      +145ms
-    再加上重排        rank@1 28/30     +3000ms
+Measured over 30 ground-truth cases:
+    BM25                            rank@1 21/30
+    BM25 + script normalization     rank@1 24/30      +145ms
+    plus reranking                  rank@1 28/30    +3,000ms
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def _pick(page, query, budget=8000, max_frac=0.35):
     return select(page, rank(page, query), budget, max_frac)
 
 
-# ── 排序 ──────────────────────────────────────────────────────────
+# -- ordering ----------------------------------------------------------------
 def test_relevant_section_ranks_first(page):
     sel = _pick(page, "which optimizer was used")
     assert sel.strategy == "bm25"
@@ -43,14 +43,16 @@ def test_relevant_section_ranks_first(page):
 
 
 def test_chrome_excluded_without_blocklist(page):
-    """導覽列/頁尾不含查詢詞,分數為 0,不需維護 chrome 黑名單就會出局。"""
+    """Navigation and footer contain no query terms, so they score zero and drop
+    out without any chrome blocklist to maintain."""
     sel = _pick(page, "optimizer adam warmup")
     picked = {p.section.id for p in sel.picks}
     assert "s0" not in picked and "s3" not in picked
 
 
 def test_no_query_falls_back_to_document_order(page):
-    """沒有 query 時用文件順序 —— 實測密度啟發式在每個預算下都輸給它。"""
+    """With no query, document order wins -- density heuristics were measured
+    losing to it at every budget."""
     sel = _pick(page, None)
     assert sel.strategy == "document_order"
     assert [p.section.id for p in sel.picks] == ["s0", "s1", "s2", "s3"]
@@ -63,9 +65,10 @@ def test_unmatched_query_falls_back(page):
 
 
 def test_oversized_section_is_capped_not_skipped():
-    """單節超過預算時要裁切而非整節收下。
+    """A section larger than the budget must be trimmed, not taken whole.
 
-    實測 OpenReview 有 21,146 tok 的單一章節,舊實作會把 4,000 的預算撐到 5.3 倍。
+    Measured case: OpenReview had a single 21,146-token chapter, and the earlier
+    implementation stretched a 4,000 budget to 5.3x.
     """
     huge = _sec("s1", "Active Venues", "venue submission deadline " * 4000, 0)
     sel = select([huge], rank([huge], "venue submission"), 8000, 0.35)
@@ -78,41 +81,44 @@ def test_empty_sections():
     assert sel.picks == [] and sel.used_tokens == 0
 
 
-# ── 繁簡正規化 ────────────────────────────────────────────────────
+# -- script normalization ----------------------------------------------------
 def test_traditional_and_simplified_produce_same_terms():
-    """繁簡正規化的用意等同英文檢索一律轉小寫:讓兩邊落在同一個字集。
+    """Script normalization serves the same purpose as lowercasing in English
+    retrieval: put both sides in one script.
 
-    沒有它,繁體查詢對簡體內容會完全失效 —— 實測全頁 21 節只有「参考文献」
-    偶然得分,選出來的是一整頁參考文獻條目。
+    Without it a Traditional query against Simplified content fails almost
+    completely -- measured, of 21 sections on a page only the references heading
+    scored at all, and what came back was a page of citation entries.
     """
     if ranking._converter() is None:
-        pytest.skip("opencc 不可用")
+        pytest.skip("opencc unavailable")
     assert set(ranking.terms("編碼器與解碼器")) == set(ranking.terms("编码器与解码器"))
     assert set(ranking.terms("訓練")) == set(ranking.terms("训练"))
 
 
 def test_cross_script_query_matches_simplified_content():
     if ranking._converter() is None:
-        pytest.skip("opencc 不可用")
+        pytest.skip("opencc unavailable")
     secs = [
         _sec("s0", "参考文献", "Vaswani Attention Is All You Need 2017 " * 40, 0),
         _sec("s1", "编码器-解码器架构", "编码器由六个相同的层堆叠而成,解码器同样由六层组成。" * 20, 1),
     ]
-    sel = _pick(secs, "編碼器 解碼器 架構")      # 繁體查詢
+    sel = _pick(secs, "編碼器 解碼器 架構")      # Traditional query
     assert sel.picks[0].section.id == "s1"
 
 
 def test_latin_text_skips_conversion():
-    """沒有 CJK 就不做轉換,省下成本(90k 頁面實測轉換要 145ms)。"""
+    """No CJK means no conversion, saving the cost (measured 145ms on a 90k page)."""
     assert ranking.normalize_script("hello world") == "hello world"
 
 
-# ── 匹配訊號 ──────────────────────────────────────────────────────
+# -- match signals -----------------------------------------------------------
 def test_match_stats_reports_breadth_not_just_boolean(page):
-    """取代舊的 query_matched 布林值。
+    """Replaces an earlier query_matched boolean.
 
-    舊欄位只表示「有任何段落分數 > 0」—— 跨字集時全頁只有一節偶然得分
-    它照樣回 true,agent 會以為查詢命中了。
+    That field only meant "some section scored above zero" -- across a script
+    mismatch, where a single section scored by coincidence, it still reported
+    true and the agent believed the query had hit.
     """
     r = rank(page, "optimizer adam warmup")
     assert r.stats.sections_scored >= 1

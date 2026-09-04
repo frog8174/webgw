@@ -1,4 +1,5 @@
-"""編排:准入 -> 快取 -> 抓取 -> 判定 -> 存快取 -> 切節 -> 檢索 -> 組裝回應。"""
+"""Orchestration: admission -> cache -> fetch -> classify -> store -> split ->
+retrieve -> assemble response."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -38,10 +39,12 @@ async def _render(
     age_s: int | None = None,
     degraded_from: str | None = None,
 ) -> dict:
-    """把 raw markdown 組裝成回傳封包。
+    """Assemble raw markdown into the response envelope.
 
-    快取命中與新抓取共用這條路徑 —— 選節永遠從 raw 重算,所以同一頁換 query
-    (或換 mode) 重查都不需要重爬。這正是存 raw 而非 fit 的理由。
+    Cache hits and fresh fetches share this path -- selection is always
+    recomputed from raw, so re-querying the same page with a different query (or
+    a different mode) never needs another crawl. That is exactly why raw is
+    stored rather than fit.
     """
     raw_tokens = tokens.count(markdown)
     env: dict = {
@@ -58,11 +61,12 @@ async def _render(
         env["cache_age_s"] = age_s
     if cache_state == "stale":
         env["note"] = (
-            f"重新抓取失敗{f' ({degraded_from})' if degraded_from else ''},"
-            f"回傳 {age_s} 秒前的快取內容。內容可能已過時。"
+            f"Re-fetch failed{f' ({degraded_from})' if degraded_from else ''}; "
+            f"returning cached content from {age_s} seconds ago. It may be out of date."
         )
 
-    # 小頁面直接回全文。省下的 token 不值得冒選錯的風險。
+    # Small pages are returned whole. The tokens saved are not worth the risk of
+    # selecting the wrong part.
     if raw_tokens <= cfg.passthrough_max_tokens:
         env.update({
             "mode": "passthrough",
@@ -80,7 +84,8 @@ async def _render(
             "returned_tokens": tokens.count(text),
             "truncated": True,
             "content": text,
-            "note": env.get("note") or "頁面沒有標題結構,已按文件順序截斷。",
+            "note": env.get("note")
+            or "The page has no heading structure; truncated in document order.",
         })
         return env
 
@@ -96,8 +101,10 @@ async def _render(
     env.update({
         "mode": sel.strategy,
         "retrieval": result.as_dict(),
-        # 取代舊的 query_matched 布林值 —— 那個只表示「有任何段落分數 > 0」,
-        # 跨字集時全頁只有「参考文献」偶然得分它也回 true,會誤導 agent。
+        # Replaces an earlier query_matched boolean, which only meant "some
+        # section scored above zero". Across a script mismatch, where the only
+        # section scoring anything was the references heading, it still reported
+        # true -- misleading the agent.
         "match": sel.stats.as_dict(),
         "returned_tokens": sel.used_tokens,
         "truncated": sel.used_tokens < raw_tokens,
@@ -117,11 +124,15 @@ async def _render(
         ][:40],
     })
     if not sel.matched and query and not env.get("note"):
-        env["note"] = "查詢在此頁沒有任何匹配,已改用文件順序截斷。可能取錯頁面了。"
+        env["note"] = (
+            "The query matched nothing on this page, so it was truncated in document "
+            "order. This may be the wrong page."
+        )
     elif sel.stats.confidence in ("low", "none") and not env.get("note"):
         env["note"] = (
-            "查詢與此頁的匹配偏弱。若回傳的段落沒有你要的資訊,"
-            "可用 mode=\"rerank\" 重試 —— 內容已快取,不會重爬。"
+            "The query matches this page only weakly. If the returned sections do not "
+            'contain what you need, retry with mode="rerank" -- the content is cached, '
+            "so it will not be crawled again."
         )
     return env
 
@@ -149,7 +160,8 @@ async def fetch(
             query, mode, cfg, reranker, cache_state="hit", age_s=cached.age_s,
         )
 
-    # 併發上限:超過時排隊等待而非拒絕 —— 抓取本來就慢,多等優於直接失敗。
+    # Concurrency ceiling: queue rather than reject. Fetching is slow anyway, so
+    # waiting beats failing outright.
     if limiter is not None:
         async with limiter:
             crawled = await client.fetch(url)
@@ -157,7 +169,8 @@ async def fetch(
         crawled = await client.fetch(url)
 
     if not crawled.ok:
-        # 抓取失敗但手上還有保留期內的舊資料 —— 回舊的並標記 stale。
+        # The fetch failed but an in-retention copy is on hand -- serve it and
+        # mark it stale.
         if cached is not None:
             return await _render(
                 url, cached.final_url, cached.title, cached.status_code, cached.markdown,
@@ -173,7 +186,8 @@ async def fetch(
     final_url = result.get("redirected_url") or url
     redirect_verdict = admission.check_redirect(url, final_url)
     if not redirect_verdict.allowed:
-        # 落點不合規時丟棄內容,且不回舊快取 —— 這是安全事件,不是暫時性失敗。
+        # Discard the content and do not fall back to cache -- this is a
+        # security event, not a transient failure.
         return _error_envelope(url, redirect_verdict.reason, redirect_verdict.detail)
 
     status = oc.classify(result, markdown)

@@ -1,36 +1,41 @@
-"""檢索模式編排:決定要不要重排,以及失敗時如何降級。
+"""Retrieval mode orchestration: whether to rerank, and how to degrade.
 
-兩種模式:
-    bm25    BM25 + 繁簡正規化。約 2.5 秒。預設。
-    rerank  BM25 取前 N 名 -> cross-encoder 重排。約 5~8 秒。
+Two modes:
+    bm25    BM25 plus script normalization. About 2.5 seconds. Default.
+    rerank  BM25 top-N shortlist -> cross-encoder rerank. About 5-8 seconds.
 
-實測 (30 個 ground-truth 案例):
+Measured on 30 ground-truth cases:
     bm25    rank@1 24/30
     rerank  rank@1 28/30
 
-── 為什麼沒有 auto 模式 ────────────────────────────────────────────
+-- Why there is no auto mode ----------------------------------------------
 
-原本想做「BM25 沒把握時才重排」,但實驗證明做不到:
+The intent was "rerank only when BM25 is unsure", but the experiment ruled it
+out:
 
-  訊號              正確組中位    錯誤組中位    是否重疊
-  有分數段落佔比        0.62        0.51        是
-  最高分             12.23        9.28        是
-  分數差距            1.64        1.46        是
-  查詢詞覆蓋率          0.88        0.94        是
-  前 3 名集中度         0.52        0.43        是
-  段落總數            22.50       95.50        是
+  signal                       correct median   wrong median   overlaps
+  share of scored sections            0.62           0.51        yes
+  top score                          12.23           9.28        yes
+  score gap                           1.64           1.46        yes
+  query term coverage                 0.88           0.94        yes
+  top-3 concentration                 0.52           0.43        yes
+  total sections                     22.50          95.50        yes
 
-六個訊號全部重疊。最極端的反例:「can I still build with Bazel」的
-score_gap 是 2.09、信心 high、查詢詞覆蓋率 1.00 —— 而 BM25 把它排第 19。
+All six signals overlap. The sharpest counterexample: "can I still build with
+Bazel" had a score gap of 2.09, confidence high, and query term coverage of
+1.00 -- and BM25 ranked the answer 19th.
 
-BM25 的分數只說明它有多「確定」,不說明它對不對,而錯得很確定正是要抓的情況。
-以頁面大小當閾值也無效:節數 >= 20 觸發 87%(等於全開),>= 30 只剩 25/30
-(比純 BM25 多 1 個)。以「全文裝不裝得下預算」判斷更糟 —— 30 頁裡只有 1 頁
-裝得下,會觸發 97%。
+A BM25 score says how *certain* the ranking is, not whether it is *right*, and
+being confidently wrong is exactly the case worth catching. Page size fails as
+a threshold too: >= 20 sections fires on 87% of pages (effectively always on),
+while >= 30 drops to 25/30 (one better than plain BM25). Using "does the full
+text fit the budget" is worse still -- only 1 of 30 pages fits, so it fires 97%
+of the time.
 
-所以決定權交給呼叫端。agent 知道我們不知道的事:這題重不重要、
-是不是已經試過一次沒找到、現在能不能等。而且 raw 已經有快取,
-用 mode="rerank" 重試同一頁不需要重爬,只付重排那幾秒。
+So the decision belongs to the caller. The agent knows things this layer does
+not: whether the question matters, whether a first attempt already missed, and
+whether it can afford to wait. Raw content is cached, so retrying the same page
+with mode="rerank" costs only the rerank seconds, not another crawl.
 """
 from __future__ import annotations
 
@@ -38,7 +43,7 @@ import logging
 import time
 from dataclasses import dataclass
 
-from .ranking import Ranking, rank
+from .ranking import MatchStats, Ranking, rank
 from .reranker import RerankClient, RerankUnavailable
 from .sections import Section
 
@@ -53,7 +58,7 @@ class RetrievalOutcome:
     ranking: Ranking
     mode_used: str
     mode_requested: str
-    degraded: str | None      # 有值代表想重排但失敗,已降級為 BM25
+    degraded: str | None      # set when rerank was wanted but failed and BM25 was used
     elapsed_ms: int
 
     def as_dict(self) -> dict:
@@ -90,31 +95,51 @@ async def retrieve(
     if requested != "rerank" or client is None or not client.configured:
         return done(base, "bm25")
 
-    # 只把 BM25 的前 top_n 名送去重排 —— 不對整頁做。
-    # 一頁常有 20~200 節,兩階段能省下 6 倍以上的模型工作量。
+    # Only BM25's top_n go to the reranker -- never the whole page. Pages
+    # commonly hold 20-200 sections, so two-stage saves 6x or more model work.
     shortlist = [i for i in base.order if base.scores[i] > 0][:top_n]
     if not shortlist:
         return done(base, "bm25")
 
     docs = [sections[i].title + "\n" + sections[i].body for i in shortlist]
     try:
-        local_order = await client.order(query or "", docs)
+        local_scored = await client.order(query or "", docs)
     except RerankUnavailable as exc:
-        # 降級而非失敗:拿得到 BM25 的結果,總比整個請求掛掉好。
-        log.warning("重排不可用,降級為 BM25: %s", exc)
+        # Degrade rather than fail: BM25 results beat losing the whole request.
+        log.warning("reranker unavailable, falling back to BM25: %s", exc)
         return done(base, "bm25", str(exc))
 
-    reordered = [shortlist[i] for i in local_order if i < len(shortlist)]
+    reordered: list[int] = []
+    rr_scores: list[float] = []
+    for local_i, score in local_scored:
+        if local_i < len(shortlist):
+            reordered.append(shortlist[local_i])
+            rr_scores.append(score)
     picked = set(reordered)
     rest = [i for i in base.order if i not in picked]
 
-    # 重排後改用名次倒數當分數:順序與重排一致,且 select() 的「分數 > 0」
-    # 條件仍然成立(它靠這個把 chrome 擋在外面)。
-    scores = list(base.scores)
-    for pos, idx in enumerate(reordered):
-        scores[idx] = 1.0 / (pos + 1)
+    # Use the reranker's own scores rather than reciprocal rank -- reciprocal
+    # rank discards "how relevant is this section", which is precisely what
+    # match.confidence is meant to express.
+    #
+    # Sections scoring 0 (padding for rows the service did not return) get a
+    # vanishing decreasing positive value so select()'s "score > 0" test still
+    # holds -- that test is what keeps page chrome out.
+    scores = [0.0] * len(sections)
+    for pos, (idx, sc) in enumerate(zip(reordered, rr_scores)):
+        scores[idx] = max(sc, 1e-9 / (pos + 1))
 
+    # Rebuild stats from the reranker's scores. Reusing BM25's stats made both
+    # modes report identical match numbers while selecting different sections --
+    # confirmed by measurement as actively misleading.
+    stats = MatchStats(
+        sections_total=len(sections),
+        sections_scored=sum(1 for sc in rr_scores if sc > 0),
+        top_score=rr_scores[0] if rr_scores else 0.0,
+        second_score=rr_scores[1] if len(rr_scores) > 1 else 0.0,
+        source="rerank",
+    )
     return done(
-        Ranking(order=reordered + rest, scores=scores, stats=base.stats, matched=True),
+        Ranking(order=reordered + rest, scores=scores, stats=stats, matched=True),
         "rerank",
     )

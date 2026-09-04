@@ -1,22 +1,25 @@
-"""查詢感知選節。
+"""Query-aware section selection.
 
-分成兩個獨立的步驟,好讓 reranker 能插在中間:
-    rank()    決定段落的順序(BM25)
-    select()  依順序填滿 token 預算
+Split into two independent steps so a reranker can sit between them:
+    rank()    decides section order (BM25)
+    select()  fills the token budget in that order
 
-實測依據 (30 個 ground-truth 案例:12 英文 + 18 中文):
+Measured on 30 ground-truth cases (12 English + 18 Chinese):
 
-    設定                   rank@1     額外成本
-    BM25                   21/30        3ms
-    BM25 + t2s             24/30      +145ms
-    BM25 + t2s + 重排       28/30     +3000ms
+    configuration                     rank@1     added cost
+    BM25                              21/30        3 ms
+    BM25 + script normalization       24/30      +145 ms
+    BM25 + normalization + rerank     28/30    +3,000 ms
 
-t2s 修好的 3 個全是繁簡跨字集;重排再修好的 5 個全是「字面不匹配但語意相關」
-(deprecated vs Deprecations、Bazel、訓練方式…),那是 BM25 的方法邊界,
-任何正規化都補不了。
+The 3 cases normalization fixed were all Traditional/Simplified script
+mismatches; the 5 the reranker fixed on top of that were all "no literal
+overlap but semantically related" (deprecated vs Deprecations, Bazel, training
+method, ...), which is the boundary of the method itself -- no amount of
+normalization reaches them.
 
-預算 8000 的依據:台積電那頁 (92k tokens) 實測 4000 ✗、6000 ✗、8000 ✓。
-max_frac 0.35 的依據:0.5 時單一段落就吃掉半個預算,實測有一次只裝進 1 節。
+Budget 8000 comes from measurement: on a 92k-token page, 4000 failed, 6000
+failed, 8000 succeeded. max_frac 0.35 likewise: at 0.5 a single section ate
+half the budget and one page fit only 1 section.
 """
 from __future__ import annotations
 
@@ -39,10 +42,12 @@ B = 0.75
 
 @functools.lru_cache(maxsize=1)
 def _converter():
-    """繁->簡轉換器。取不到就回 None,呼叫端據此略過正規化。
+    """Traditional-to-Simplified converter, or None if unavailable.
 
-    正規化的用意跟英文檢索一律轉小寫相同:讓查詢和文件落在同一個字集,
-    BM25 本身完全不用改。實測 12 個中文案例:改善 4、持平 8、變差 0。
+    Callers skip normalization when this returns None. The purpose is the same
+    as lowercasing in English retrieval: put query and document in one script so
+    BM25 itself needs no changes. Measured across 12 Chinese cases: 4 improved,
+    8 unchanged, 0 regressed.
     """
     try:
         from opencc import OpenCC
@@ -53,7 +58,10 @@ def _converter():
 
 
 def normalize_script(text: str) -> str:
-    """把繁體正規化為簡體。沒有 CJK 就原樣返回,省下轉換成本。"""
+    """Normalize Traditional Chinese to Simplified.
+
+    Returns the text unchanged when it holds no CJK, saving the conversion cost.
+    """
     if not _HAS_CJK.search(text):
         return text
     cc = _converter()
@@ -61,11 +69,13 @@ def normalize_script(text: str) -> str:
 
 
 def terms(text: str) -> list[str]:
-    """拉丁詞 + CJK 字元 bigram + 數字。
+    """Latin words, CJK character bigrams, and numbers.
 
-    CJK 用 bigram 而非分詞器:不必額外相依,對中文檢索是標準做法。
-    轉換前先做繁簡正規化 —— 否則繁體查詢對簡體內容會完全失效
-    (實測:全頁 21 節只有「参考文献」偶然得分)。
+    CJK uses bigrams rather than a word segmenter: no extra dependency, and it
+    is the standard approach for Chinese retrieval. Script normalization runs
+    first -- without it a Traditional query against Simplified content fails
+    almost completely (measured: of 21 sections on a page, only the references
+    heading scored at all, by coincidence).
     """
     low = normalize_script(strip_links(text)).lower()
     out = _LATIN.findall(low)
@@ -106,17 +116,23 @@ def bm25_scores(sections: list[Section], query: str) -> list[float]:
 
 @dataclass
 class MatchStats:
-    """查詢與頁面的匹配品質。
+    """How well the query matched the page.
 
-    取代舊的 query_matched 布林值 —— 那個只表示「有任何段落分數 > 0」,
-    實測會誤導:跨字集時全頁只有「参考文献」偶然得 0.83 分,它照樣回 true,
-    agent 會以為查詢命中了。
+    Replaces an earlier `query_matched` boolean, which only meant "some section
+    scored above zero" and was measured to mislead: across a script mismatch the
+    only section scoring anything was the references heading, at 0.83, and the
+    boolean still reported true -- so the agent believed the query had hit.
     """
 
     sections_total: int
     sections_scored: int
     top_score: float
     second_score: float
+    # Which ranker produced these scores. The two scales are unrelated, so
+    # confidence thresholds cannot be shared:
+    #   bm25   unbounded; relevant sections measured in the 5-30 range
+    #   rerank sigmoid output 0-1; relevant >0.99, irrelevant <0.001
+    source: str = "bm25"
 
     @property
     def scored_ratio(self) -> float:
@@ -124,7 +140,7 @@ class MatchStats:
 
     @property
     def score_gap(self) -> float:
-        """最高分與次高分的比值。接近 1 表示分不出勝負。"""
+        """Top score over runner-up. Near 1 means the ranking cannot separate them."""
         if self.second_score <= 0:
             return float("inf") if self.top_score > 0 else 0.0
         return self.top_score / self.second_score
@@ -133,6 +149,15 @@ class MatchStats:
     def confidence(self) -> str:
         if self.sections_scored == 0:
             return "none"
+        if self.source == "rerank":
+            # Cross-encoder scores are sigmoid outputs, so the absolute value is
+            # the meaningful signal -- score gaps on this scale routinely run
+            # into the thousands and lose all discriminating power.
+            if self.top_score >= 0.5:
+                return "high"
+            if self.top_score >= 0.1:
+                return "medium"
+            return "low"
         if self.scored_ratio < 0.15 or self.top_score < 1.0:
             return "low"
         if self.score_gap < 1.5:
@@ -141,6 +166,7 @@ class MatchStats:
 
     def as_dict(self) -> dict:
         return {
+            "source": self.source,
             "sections_total": self.sections_total,
             "sections_scored": self.sections_scored,
             "scored_ratio": round(self.scored_ratio, 3),
@@ -152,17 +178,18 @@ class MatchStats:
 
 @dataclass
 class Ranking:
-    order: list[int]          # sections 的索引,由最相關排到最不相關
-    scores: list[float]       # 與 sections 同序的原始分數
+    order: list[int]          # section indices, most relevant first
+    scores: list[float]       # raw scores, parallel to sections
     stats: MatchStats
-    matched: bool             # 是否有任何段落匹配到查詢
+    matched: bool             # whether any section matched the query
 
 
 def rank(sections: list[Section], query: str | None) -> Ranking:
-    """依查詢排序段落。沒有 query 或完全無匹配時退回文件順序。
+    """Order sections by query, falling back to document order.
 
-    退回文件順序而非密度過濾,是實測結論:密度啟發式在每個預算下都輸給
-    單純按順序截斷(2k 預算 1/12 vs 1/12,8k 預算 5/12 vs 10/12)。
+    The fallback is document order rather than density filtering, and that is a
+    measured conclusion: density heuristics lost to plain truncation at every
+    budget (1/12 vs 1/12 at a 2k budget, 5/12 vs 10/12 at 8k).
     """
     n = len(sections)
     empty = MatchStats(n, 0, 0.0, 0.0)
@@ -186,7 +213,7 @@ def rank(sections: list[Section], query: str | None) -> Ranking:
 @dataclass
 class Pick:
     section: Section
-    take_tokens: int          # 實際納入的 token 數,可能小於 section.tokens
+    take_tokens: int          # tokens actually taken, may be less than section.tokens
     truncated: bool
     score: float
 
@@ -207,13 +234,15 @@ def select(
     max_frac: float = 0.35,
     strategy: str = "bm25",
 ) -> Selection:
-    """依既定順序填滿預算。
+    """Fill the budget following the given order.
 
-    停止而非跳過:跳過裝不下的段落、繼續撿小的來填,實測多花 575 tokens
-    而命中率完全不變 —— 那些是純填充物。
+    Stop rather than skip: skipping an oversized section to keep picking smaller
+    ones was measured spending 575 extra tokens with no change in hit rate --
+    what it picked up was pure filler.
 
-    單節上限 = budget * max_frac:防止超大段落炸掉預算(實測 OpenReview 有
-    21,146 tok 的單一章節,舊實作會把 4,000 的預算撐到 5.3 倍)。
+    Per-section cap = budget * max_frac, so one huge section cannot blow the
+    budget. Measured case: OpenReview had a single 21,146-token chapter, and the
+    earlier implementation stretched a 4,000 budget to 5.3x.
     """
     picks: list[Pick] = []
     used = 0
@@ -222,8 +251,9 @@ def select(
 
     for i in ranking.order:
         score = ranking.scores[i] if i < len(ranking.scores) else 0.0
-        # 不匹配查詢的段落一律不收。導覽列、頁尾、登入元件不含查詢詞,
-        # 分數為 0 自然出局 —— 不需要維護 chrome 黑名單。
+        # Never take sections that do not match the query. Navigation bars,
+        # footers and login widgets contain no query terms, so they score zero
+        # and drop out on their own -- no chrome blocklist to maintain.
         if require_score and score <= 0:
             break
         sec = sections[i]

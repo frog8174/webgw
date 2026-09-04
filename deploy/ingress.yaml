@@ -1,37 +1,41 @@
-# Ingress + HTTPS。選用,但建議 ——
-# 走純 HTTP 時 Bearer token 是明文傳輸,同網段抓封包就拿得到。
+# Ingress with HTTPS. Optional, but recommended -- over plain HTTP the Bearer
+# token travels in clear text and anyone capturing traffic on the same segment
+# can read it.
 #
-# 套用前要做三件事:
-#   1. 改下面的網域名稱(兩處:tls.hosts 與 rules.host)
-#   2. 把該網域加進 ConfigMap 的 MCP_ALLOWED_HOSTS ——
-#      Host 標頭會變成網域名稱,漏了會全部回 421
-#   3. 準備 TLS 憑證(cert-manager 自動簽發,或手動建 Secret)
+# Three things to do before applying:
+#   1. Change the domain name (in two places: tls.hosts and rules.host)
+#   2. Add that domain to MCP_ALLOWED_HOSTS in the ConfigMap -- the Host header
+#      becomes the domain name, and omitting it makes everything return 421
+#   3. Provision a TLS certificate (cert-manager, or create the Secret by hand)
 #
-# 不需要處理 SSE 相關的 proxy buffering ——
-# MCP_JSON_RESPONSE 預設為 1,回應是純 JSON,沒有長連線串流。
+# No SSE-related proxy buffering settings are needed: MCP_JSON_RESPONSE defaults
+# to 1, so responses are plain JSON with no long-lived streaming.
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: webgw
   annotations:
-    # 抓取逾時 30 秒,加上併發上限造成的排隊,可能超過 nginx 預設的 60 秒。
+    # A fetch times out at 30 seconds, and queueing behind the concurrency limit
+    # can push past nginx's 60 second default.
     nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
 
-    # 只允許特定來源網段。想完全限制在區網時取消註解並改成你的網段。
+    # Restrict to specific source ranges. Uncomment and set your own range to
+    # confine access to the local network.
     # nginx.ingress.kubernetes.io/whitelist-source-range: "192.168.0.0/16"
 
-    # 用 cert-manager 自動簽發時取消註解,並改成你的 ClusterIssuer 名稱。
+    # Uncomment for automatic certificates via cert-manager, and set your own
+    # ClusterIssuer name.
     # cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - webgw.example.com          # ← 改成你的網域
-      secretName: webgw-tls          # cert-manager 會自動建立;手動則要先建好
+        - webgw.example.com          # <- change to your domain
+      secretName: webgw-tls          # cert-manager creates this; otherwise create it first
   rules:
-    - host: webgw.example.com        # ← 改成你的網域
+    - host: webgw.example.com        # <- change to your domain
       http:
         paths:
           - path: /mcp
@@ -41,5 +45,6 @@ spec:
                 name: webgw
                 port:
                   number: 8080
-          # /healthz 刻意不放進來 —— 探針走叢集內部,不需要經過 Ingress。
-          # 對外少一個端點就少一個可被探測的目標。
+          # /healthz is deliberately left out -- probes run inside the cluster
+          # and do not need the Ingress. One fewer public endpoint is one fewer
+          # thing to probe.

@@ -1,4 +1,5 @@
-"""准入層測試。規則來自上游 0.8.7~0.9.0 連續四個 SSRF CVE 的教訓。"""
+"""Admission layer. The rules come from four consecutive SSRF CVEs upstream
+across 0.8.7-0.9.0."""
 from __future__ import annotations
 
 import pytest
@@ -24,7 +25,8 @@ def test_forbidden_destinations(url):
 
 @pytest.mark.parametrize("url", ["https://arxiv.org/pdf/1706.03762.pdf", "https://x.com/a.zip"])
 def test_binary_blocked_preflight(url):
-    """實測 PDF 會讓上游硬崩潰 (Page.goto: Download is starting),在送出前擋掉。"""
+    """PDFs were measured crashing upstream outright (Page.goto: Download is
+    starting), so they are rejected before dispatch."""
     v = admission.check(url, resolve=False)
     assert v.allowed is False and v.reason == "unsupported_content"
 
@@ -46,15 +48,16 @@ def test_redirect_to_public_is_allowed():
 
 
 def test_allowed_hosts_expand_to_wildcard_ports():
-    """不含埠的主機要自動允許任意埠。
+    """Hosts given without a port must also match any port.
 
-    上游 Host 比對是完全相符含埠號的,NodePort 的 Host 會是 <節點IP>:<nodePort>,
-    不展開就會全部被擋成 421。
+    The upstream Host check is an exact match including the port, and a NodePort
+    deployment presents `<node IP>:<nodePort>` -- without expansion every
+    request is rejected with 421.
     """
     from webgw.config import expand_allowed_hosts
 
     assert expand_allowed_hosts(("127.0.0.1", "localhost")) == [
         "127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*",
     ]
-    # 已經帶埠的維持原樣,不重複展開
+    # Hosts that already carry a port are left alone, not expanded again.
     assert expand_allowed_hosts(("192.168.1.60:30080",)) == ["192.168.1.60:30080"]

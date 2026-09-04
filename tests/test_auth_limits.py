@@ -1,8 +1,9 @@
-"""認證、綁定安全機制、限流。
+"""Authentication, the binding safeguard, and rate limiting.
 
-MCP 規格的傳輸安全章節:伺服器 SHOULD 對所有連線實作認證。
-在此之前 gateway 對任何連得到該埠的人全部放行 —— 而這個工具的價值正是
-「從你自己的網路出去爬」,無認證等於把 IP 信譽開放給任何人。
+The MCP transport security section says servers SHOULD authenticate all
+connections. Before this existed the gateway served anyone who could reach the
+port -- and the value of this tool is precisely that it crawls from your own
+network, so running unauthenticated hands your IP reputation to anyone.
 """
 from __future__ import annotations
 
@@ -40,10 +41,10 @@ async def _call(wrapped, method="POST", path="/mcp", headers=None):
     return sent[0]["status"], passed
 
 
-# ── 認證 ──────────────────────────────────────────────────────────
+# -- authentication ----------------------------------------------------------
 async def test_missing_token_is_rejected():
     async def inner(scope, receive, send):
-        raise AssertionError("未授權的請求不該進入內層")
+        raise AssertionError("an unauthorized request must not reach the inner app")
 
     status, _ = await _call(BearerAuth(inner, TOKEN))
     assert status == 401
@@ -51,7 +52,7 @@ async def test_missing_token_is_rejected():
 
 async def test_wrong_token_is_rejected():
     async def inner(scope, receive, send):
-        raise AssertionError("錯誤 token 不該進入內層")
+        raise AssertionError("a wrong token must not reach the inner app")
 
     hdr = [(b"authorization", b"Bearer wrong-token")]
     status, _ = await _call(BearerAuth(inner, TOKEN), headers=hdr)
@@ -59,7 +60,7 @@ async def test_wrong_token_is_rejected():
 
 
 def _echo():
-    """會回 200 並記錄收到的路徑,用來確認請求真的穿透到內層。"""
+    """Returns 200 and records the path, confirming the request really got through."""
     seen: dict = {}
 
     async def inner(scope, receive, send):
@@ -79,7 +80,7 @@ async def test_correct_token_passes():
 
 
 async def test_healthz_stays_public():
-    """k8s 的存活/就緒探針必須能在沒有憑證的情況下打通。"""
+    """Kubernetes liveness and readiness probes must work without credentials."""
     status, _ = await _call(BearerAuth(_echo(), TOKEN), method="GET", path="/healthz")
     assert status == 200
 
@@ -95,11 +96,13 @@ async def test_scheme_must_be_bearer():
     assert status == 401
 
 
-# ── 綁定安全機制 ──────────────────────────────────────────────────
+# -- binding safeguard -------------------------------------------------------
 def test_no_token_refuses_public_bind(monkeypatch):
-    """沒有 token 卻要綁 0.0.0.0 = 對外開放且不設防,強制降級為 loopback。
+    """No token plus 0.0.0.0 means publicly reachable and unprotected, so the
+    binding is forced down to loopback.
 
-    做法照抄上游 crawl4ai 0.9.2 —— 它的同款設計實測擋住過一次真實暴露。
+    The approach is taken from upstream crawl4ai 0.9.2, whose equivalent design
+    was measured catching a real exposure.
     """
     monkeypatch.setenv("GATEWAY_HOST", "0.0.0.0")
     monkeypatch.delenv("WEBGW_AUTH_TOKEN", raising=False)
@@ -110,7 +113,7 @@ def test_no_token_refuses_public_bind(monkeypatch):
     importlib.reload(config)
     host, warning = config.effective_host(config.Config())
     assert host == "127.0.0.1"
-    assert warning and "拒絕綁定" in warning
+    assert warning and "refusing to bind" in warning
 
 
 def test_token_allows_public_bind(monkeypatch):
@@ -136,7 +139,7 @@ def test_loopback_without_token_warns_but_allows():
     assert host == "127.0.0.1" and warning is not None
 
 
-# ── 限流 ──────────────────────────────────────────────────────────
+# -- rate limiting -----------------------------------------------------------
 def test_rate_limiter_blocks_over_limit():
     r = RateLimiter(max_requests=3, window_s=60)
     assert [r.allow("k") for _ in range(4)] == [True, True, True, False]
@@ -145,7 +148,7 @@ def test_rate_limiter_blocks_over_limit():
 def test_rate_limiter_is_per_key():
     r = RateLimiter(max_requests=1, window_s=60)
     assert r.allow("a") is True
-    assert r.allow("b") is True      # 不同來源互不影響
+    assert r.allow("b") is True      # separate callers do not affect each other
     assert r.allow("a") is False
 
 
@@ -175,7 +178,8 @@ def test_rate_limiter_prune_drops_idle_keys():
 
 
 async def test_concurrency_limiter_caps_parallelism():
-    """超過上限的請求要排隊,不是被拒絕 —— 抓取本來就慢,多等優於直接失敗。"""
+    """Requests over the limit queue rather than being rejected -- fetching is
+    slow anyway, so waiting beats failing outright."""
     limiter = ConcurrencyLimiter(2)
     active = 0
     peak = 0

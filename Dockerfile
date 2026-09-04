@@ -14,8 +14,8 @@ COPY src ./src
 
 RUN pip install --no-cache-dir . \
  && mkdir -p "$TIKTOKEN_CACHE_DIR" \
- # 建置期預熱編碼檔快取:執行期就不需要連外下載,
- # 這對只開 NodePort、沒有出向網路的部署環境是必要的。
+ # Warm the encoding cache at build time so nothing has to be downloaded at
+ # runtime -- required for deployments with no outbound network access.
  && python -c "import tiktoken; tiktoken.get_encoding('cl100k_base').encode('warm')" \
  && useradd --create-home --uid 10001 app \
  && mkdir -p /data \

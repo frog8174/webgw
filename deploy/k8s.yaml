@@ -1,14 +1,14 @@
-# webgw NodePort 部署範本。
+# webgw NodePort deployment template.
 #
-# 套用順序:先 crawl4ai.yaml,等它 Ready 之後再套這份。
+# Apply order: crawl4ai.yaml first, then this once crawl4ai is Ready.
 #
-# 使用前必改的三處:
-#   1. Secret 的 crawl4ai-token —— 要與 crawl4ai.yaml 的 api-token 相同
-#   2. Secret 的 webgw-auth-token —— 客戶端要帶的 Bearer token
-#   3. MCP_ALLOWED_HOSTS —— 必須包含 <節點IP>:<nodePort>,否則 DNS rebinding
-#      防護會把所有請求擋成 421。這是最容易踩的坑。
+# Three things must be changed before use:
+#   1. Secret crawl4ai-token -- must match api-token in crawl4ai.yaml
+#   2. Secret webgw-auth-token -- the Bearer token clients will present
+#   3. MCP_ALLOWED_HOSTS -- must contain <node IP>:<nodePort>, or DNS rebinding
+#      protection rejects every request with 421. This is the easiest trap here.
 #
-# 網路隔離見 networkpolicy.yaml(選用,但建議)。
+# For network isolation see networkpolicy.yaml (optional, but recommended).
 ---
 apiVersion: v1
 kind: Secret
@@ -17,24 +17,29 @@ metadata:
 type: Opaque
 stringData:
   crawl4ai-token: "CHANGE_ME"
-  # MCP 規格:伺服器 SHOULD 對所有連線實作認證。
-  # 留空的話 gateway 會拒絕綁 0.0.0.0,Service 將無法轉發。
+  # The MCP specification says servers SHOULD authenticate all connections.
+  # Left empty, the gateway refuses to bind 0.0.0.0 and the Service has nothing
+  # to forward to.
   webgw-auth-token: "CHANGE_ME"
+  # Only needed with a commercial reranking service (Cohere, Jina, Voyage).
+  # Self-hosted vLLM does not need it.
+  # reranker-api-key: "CHANGE_ME"
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: webgw-config
 data:
-  # 叢集內的 Service DNS。crawl4ai 用 ClusterIP,不對外暴露。
-  # 跨 namespace 時寫全名:http://crawl4ai.<namespace>.svc.cluster.local:11235
+  # In-cluster Service DNS. crawl4ai is ClusterIP and is never exposed.
+  # Across namespaces, use the full name:
+  #   http://crawl4ai.<namespace>.svc.cluster.local:11235
   CRAWL4AI_BASE_URL: "http://crawl4ai:11235"
   GATEWAY_HOST: "0.0.0.0"
   GATEWAY_PORT: "8080"
   SELECT_BUDGET_TOKENS: "8000"
   PASSTHROUGH_MAX_TOKENS: "4000"
   FETCH_TIMEOUT_S: "30"
-  # 改成你的節點 IP 與 nodePort。可列多個,逗號分隔。
+  # Change to your node IP and nodePort. Multiple entries, comma separated.
   MCP_ALLOWED_HOSTS: "192.168.1.60:30080,localhost,127.0.0.1"
   CACHE_PATH: "/data/cache.sqlite3"
   CACHE_RETENTION_DAYS: "14"
@@ -42,15 +47,17 @@ data:
   CACHE_DOMAIN_RULES: "technews.tw=3600,www.ithome.com.tw=3600"
   CACHE_MAX_BYTES: "2147483648"
   CACHE_CLEANUP_INTERVAL_S: "3600"
-  # stateless 會讓客戶端取不到工具清單(實測 OpenCode),保持關閉。
+  # Stateless leaves clients unable to retrieve the tool list (measured with
+  # OpenCode). Keep it off.
   MCP_STATELESS: "0"
   MAX_CONCURRENT_FETCHES: "4"
-  # 檢索:bm25(快,約 2.5s) | rerank(準,約 5~8s)。
-  # 實測 30 案例 rank@1:bm25 24/30、rerank 28/30。
-  # 沒有 auto 模式 —— 實驗證明沒有訊號能預測 BM25 何時會錯。
+  # Retrieval: bm25 (fast, about 2.5s) | rerank (accurate, about 5-8s).
+  # Measured over 30 cases, rank@1: bm25 24/30, rerank 28/30.
+  # There is no auto mode -- no signal predicts when BM25 is wrong.
   RETRIEVAL_MODE: "bm25"
-  # 用叢集內的 Service,不要用公開 ingress —— 走 ingress 會被 NetworkPolicy
-  # 擋掉,且是 Pod -> 出叢集 -> 再進來的繞路。改成你的 reranker Service 名稱。
+  # Use the in-cluster Service, not a public ingress -- going through the
+  # ingress is blocked by the NetworkPolicy and takes the long way round
+  # (pod -> out of the cluster -> back in). Change to your reranker Service name.
   RERANKER_URL: "http://bge-reranker:8000"
   RERANKER_MODEL: "bge-reranker-v2-m3"
   RERANK_TOP_N: "30"
@@ -66,7 +73,7 @@ spec:
   accessModes: [ReadWriteOnce]
   resources:
     requests:
-      # 需大於 CACHE_MAX_BYTES,並預留 SQLite WAL 與 vacuum 的額外空間。
+      # Must exceed CACHE_MAX_BYTES, with headroom for the SQLite WAL and vacuum.
       storage: 4Gi
 ---
 apiVersion: apps/v1
@@ -74,8 +81,9 @@ kind: Deployment
 metadata:
   name: webgw
 spec:
-  # 注意:PVC 是 ReadWriteOnce,快取為 SQLite 單檔,所以固定 1 副本。
-  # 要水平擴展需改用 RWX 儲存或外部快取後端。
+  # Note: the PVC is ReadWriteOnce and the cache is a single SQLite file, so
+  # this is pinned to 1 replica. Scaling out requires RWX storage or an external
+  # cache backend.
   replicas: 1
   selector:
     matchLabels: { app: webgw }
@@ -83,35 +91,42 @@ spec:
     metadata:
       labels: { app: webgw }
     spec:
-      # 關掉 k8s 自動注入的 Service 環境變數。
+      # Disable the Service environment variables Kubernetes injects.
       #
-      # k8s 沿用 Docker 早期行為:namespace 裡每有一個 Service,就替每個 Pod
-      # 注入一組 <SERVICE_NAME>_PORT 之類的變數。Service 叫 crawl4ai 時會注入
+      # Kubernetes inherits early Docker behaviour: for every Service in the
+      # namespace it injects a set of <SERVICE_NAME>_PORT style variables into
+      # every pod. With a Service named crawl4ai that means
       #   CRAWL4AI_PORT=tcp://10.x.x.x:11235
-      # 而 crawl4ai 這支程式自己也用 CRAWL4AI_PORT 決定監聽埠 —— 被蓋掉之後
-      # gunicorn 拿這個 URL 當埠號解析,啟動即崩潰:
+      # and crawl4ai itself uses CRAWL4AI_PORT to choose its listening port. Once
+      # overwritten, gunicorn parses that URL as a port number and dies at
+      # startup:
       #   Error: 'tcp://10.105.110.45:11235' is not a valid port number.
       #
-      # 這只影響環境變數注入,DNS 不受影響 —— http://crawl4ai:11235 照常可用。
+      # This affects environment injection only; DNS is untouched, so
+      # http://crawl4ai:11235 keeps working.
       enableServiceLinks: false
-      # fsGroup 必須放在 Pod 層 —— 容器層的 securityContext 沒有這個欄位。
+      # fsGroup must sit at pod level -- the container-level securityContext has
+      # no such field.
       #
-      # PVC 掛上來時擁有者是 root,而容器以 uid 10001 執行,預設寫不進去:
+      # A freshly mounted PVC is owned by root while the container runs as uid
+      # 10001, so by default it cannot write:
       #   sqlite3.OperationalError: unable to open database file
       #
-      # fsGroup 會讓 kubelet 把掛載卷的群組改成這個值並加上 setgid,
-      # 非 root 的行程才寫得進去。
+      # fsGroup makes the kubelet change the volume's group to this value and set
+      # setgid, which is what lets the non-root process write.
       #
-      # 注意:Docker 的具名卷會沿用映像裡該目錄的擁有者,所以本機 compose 測不出這個問題。
-      # k8s 的 PVC 不會,它直接蓋掉映像裡的目錄權限。
+      # Note: Docker named volumes inherit the ownership of that directory in the
+      # image, so local compose never reproduces this. Kubernetes PVCs do not --
+      # they override the image's directory permissions outright.
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
         fsGroup: 10001
       containers:
         - name: webgw
-          # 標籤 + digest:標籤可讀,digest 保證拉到的是這一個。
-          image: abc99012/webgw:0.3.0@sha256:7a5795155c1078ab37607135dda19c17937f593aaba95b737b7b2631fc63c6e6
+          # Tag plus digest: the tag is readable, the digest guarantees this
+          # exact build is what runs.
+          image: abc99012/webgw:0.3.1@sha256:1d69c5f5057145acb9df3f1637159de0467691710d9817a7a395c01d157954d9
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -127,6 +142,11 @@ spec:
             - name: WEBGW_AUTH_TOKEN
               valueFrom:
                 secretKeyRef: { name: webgw-secrets, key: webgw-auth-token }
+            # Only for a commercial reranking service. An API key belongs in the
+            # Secret, never in the ConfigMap.
+            # - name: RERANKER_API_KEY
+            #   valueFrom:
+            #     secretKeyRef: { name: webgw-secrets, key: reranker-api-key }
           readinessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 5
@@ -140,7 +160,7 @@ spec:
             limits:   { cpu: "500m", memory: "512Mi" }
           securityContext:
             allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true   # /data 是掛載卷,可寫
+            readOnlyRootFilesystem: true   # /data is a mounted volume and stays writable
             capabilities: { drop: ["ALL"] }
       volumes:
         - name: cache

@@ -1,15 +1,21 @@
-# 網路隔離。實作原始 spec 第 C 項:「容器層另加 egress 防火牆擋私有網段」。
+# Network isolation: an egress firewall that blocks private ranges at the
+# container layer.
 #
-# 這是 SSRF 的第三道防線,前兩道是:
-#   1. webgw 的 admission.py —— 送出前解析 DNS 並檢查所有回傳位址
-#   2. crawl4ai 0.9.2 的 egress pinning proxy —— 上游內建
+# This is the third line of SSRF defence. The first two are:
+#   1. webgw's admission.py -- resolves DNS and checks every returned address
+#      before dispatching
+#   2. crawl4ai 0.9.2's egress pinning proxy -- built in upstream
 #
-# 為什麼要三道:上游在 0.8.7~0.9.0 有過四次「檢查存在但有路徑沒套到」的 CVE。
-# 前兩道都是應用層的字串/位址判斷,這一道在網路層執行,繞不過去。
+# Why three: upstream has a track record of "the check exists but one path does
+# not apply it", with four consecutive CVEs across 0.8.7-0.9.0. The first two
+# layers are application-level string and address checks; this one is enforced
+# in the network and cannot be bypassed.
 #
-# ⚠ 前提:叢集的 CNI 必須支援 NetworkPolicy(Calico、Cilium 等)。
-#   Flannel 預設不支援 —— 套用會成功但完全不生效,給你錯誤的安全感。
-#   先確認:kubectl get networkpolicy 有列出,且實測私網位址真的被擋。
+# Prerequisite: the cluster CNI must support NetworkPolicy (Calico, Cilium, and
+#   similar). Flannel does not by default -- applying this succeeds but does
+#   nothing, which gives a false sense of security. Verify first: check that
+#   `kubectl get networkpolicy` lists it, and confirm by test that a private
+#   address really is blocked.
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -21,7 +27,8 @@ spec:
   policyTypes: [Ingress, Egress]
 
   ingress:
-    # 只接受來自 webgw 的連線。叢集內其他 Pod 一律拒絕。
+    # Accept connections from webgw only. Every other pod in the cluster is
+    # refused.
     - from:
         - podSelector:
             matchLabels: { app: webgw }
@@ -30,7 +37,7 @@ spec:
           protocol: TCP
 
   egress:
-    # DNS 必須放行,否則什麼網域都解析不了。
+    # DNS must be allowed, or no domain resolves at all.
     - to:
         - namespaceSelector: {}
           podSelector:
@@ -41,19 +48,20 @@ spec:
         - port: 53
           protocol: TCP
 
-    # 對外爬取:允許整個網際網路,但排除所有私有網段。
-    # 這一條讓「公開網址 302 轉址到內網」這類攻擊在網路層就失效 ——
-    # 即使應用層的檢查有漏,封包也出不去。
+    # Outbound crawling: the whole internet is allowed, minus every private
+    # range. This defeats "public URL 302s into the internal network" at the
+    # network layer -- even if an application-level check has a gap, the packet
+    # cannot leave.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
-              - 10.0.0.0/8        # RFC1918 (通常也含叢集的 Pod/Service 網段)
+              - 10.0.0.0/8        # RFC1918 (usually also the cluster pod/service range)
               - 172.16.0.0/12     # RFC1918
               - 192.168.0.0/16    # RFC1918
-              - 169.254.0.0/16    # link-local,含雲端 metadata 169.254.169.254
+              - 169.254.0.0/16    # link-local, includes cloud metadata 169.254.169.254
               - 127.0.0.0/8       # loopback
-              - 100.64.0.0/10     # CGNAT,部分雲端內部服務使用
+              - 100.64.0.0/10     # CGNAT, used by some cloud internal services
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -64,23 +72,41 @@ spec:
     matchLabels: { app: webgw }
   policyTypes: [Egress]
   egress:
-    # webgw 只需要連 crawl4ai、重排服務和 DNS。它自己從不直接對外抓網頁。
+    # webgw only needs crawl4ai, the reranker and DNS. It never fetches web
+    # pages directly itself.
     - to:
         - podSelector:
             matchLabels: { app: crawl4ai }
       ports:
         - port: 11235
           protocol: TCP
-    # 重排服務。務必用**叢集內的 Service**,不要用公開的 ingress ——
-    # 走 ingress 會被這條 NetworkPolicy 擋掉(實測:連線掛住直到 15 秒逾時,
-    # 降級為 bm25),而且那是 Pod -> 出叢集 -> DNS -> 再從 ingress 進來的繞路。
+    # The reranking service. Use the *in-cluster Service*, never a public
+    # ingress -- going through the ingress is blocked by this very policy, and
+    # it is the long way round: pod -> out of the cluster -> DNS -> back in
+    # through the ingress.
     #
-    # 對應 ConfigMap 的 RERANKER_URL 要改成 http://<reranker-service>:8000
+    # Note: the port here is the **targetPort on the pod**, not the Service
+    #   port. A Service is only a forwarder: the packet is sent to the Service's
+    #   8080 and arrives at the pod as 8000. NetworkPolicy runs before the packet
+    #   enters the pod, so what it sees is 8000.
+    #
+    #   That means the two places carry different port numbers, which is
+    #   counterintuitive:
+    #     RERANKER_URL in the ConfigMap -> Service port, http://<svc>:8080
+    #     ports here                    -> targetPort, 8000
+    #
+    #   Getting this wrong presents as a **timeout**, not connection refused --
+    #   the packet is dropped by the rule, so the connection hangs until the
+    #   client times out after 15 seconds and degrades to bm25.
+    #
+    # Confirm the real values with:
+    #   kubectl get svc <svc> -o jsonpath='{.spec.ports[*].targetPort}'
+    #   kubectl get pod --show-labels | grep rerank
     - to:
         - podSelector:
-            matchLabels: { app: bge-reranker-v2-m3-vllm }   # <- 改成你的 reranker Pod 標籤
+            matchLabels: { app: bge-reranker-v2-m3-vllm }
       ports:
-        - port: 8080
+        - port: 8000        # targetPort, not the Service's 8080
           protocol: TCP
     - to:
         - namespaceSelector: {}

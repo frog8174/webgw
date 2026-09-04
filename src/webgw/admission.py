@@ -1,12 +1,15 @@
-"""URL 准入。送出前擋掉不該爬的目的地。
+"""URL admission. Rejects destinations that must not be crawled, before sending.
 
-與上游 crawl4ai 的關係:0.9.2 內建 egress pinning proxy,實測會解析 DNS 後檢查真實 IP
-(`169.254.169.254.nip.io` 被擋),且 /crawl 與 /crawl/stream 兩條路徑都套用。
-所以這一層是**第二道防線**而非唯一防線 —— 但仍然必做,因為該專案有四次
-「檢查存在但有路徑沒套到」的紀錄 (0.8.7~0.9.0 連續四個 CVE)。
+Relationship to upstream crawl4ai: 0.9.2 ships an egress pinning proxy that was
+measured resolving DNS and checking the real IP (`169.254.169.254.nip.io` was
+blocked), applied on both /crawl and /crawl/stream. So this layer is a *second*
+line of defence rather than the only one -- but it is still required, because
+that project has a track record of "the check exists but one path does not
+apply it": four consecutive CVEs across 0.8.7-0.9.0.
 
-重要區分:本模組只檢查**使用者要求爬取的 URL**。gateway 連往上游 crawl4ai 的位址
-(可能是區網 IP) 不經過這裡。
+Important distinction: this module only checks the URL *the user asked to
+crawl*. The address the gateway uses to reach upstream crawl4ai (possibly a
+private LAN IP) does not pass through here.
 """
 from __future__ import annotations
 
@@ -17,9 +20,9 @@ from urllib.parse import urlparse
 
 ALLOWED_SCHEMES = {"http", "https"}
 
-# crawl4ai 是 HTML pipeline。實測 arXiv PDF 會讓它硬崩潰:
+# crawl4ai is an HTML pipeline. An arXiv PDF was measured crashing it outright:
 #   RuntimeError: Failed on navigating ACS-GOTO: Page.goto: Download is starting
-# 所以在送出前就擋掉,不要讓它崩。
+# So these are rejected before dispatch rather than left to crash upstream.
 BINARY_SUFFIXES = (
     ".pdf", ".zip", ".gz", ".tar", ".7z", ".rar",
     ".exe", ".dmg", ".msi", ".deb", ".rpm", ".apk",
@@ -41,7 +44,8 @@ def _ip_is_forbidden(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         return True
     if ip.is_reserved or ip.is_multicast or ip.is_unspecified:
         return True
-    # IPv4-mapped / 6to4 / NAT64 等轉換形式 —— 上游 0.8.8 就是被這類繞過打穿的。
+    # IPv4-mapped, 6to4, NAT64 and similar transition forms -- this class of
+    # bypass is exactly what broke upstream 0.8.8.
     if isinstance(ip, ipaddress.IPv6Address):
         mapped = ip.ipv4_mapped or getattr(ip, "sixtofour", None)
         if mapped is not None and _ip_is_forbidden(mapped):
@@ -67,7 +71,7 @@ def check(url: str, *, resolve: bool = True) -> Verdict:
         if path.endswith(suf):
             return Verdict(False, "unsupported_content", f"binary/document type: {suf}")
 
-    # 字面 IP 直接檢查,不必經過 DNS。
+    # Literal IPs are checked directly, no DNS needed.
     try:
         literal = ipaddress.ip_address(host)
     except ValueError:
@@ -80,7 +84,8 @@ def check(url: str, *, resolve: bool = True) -> Verdict:
     if not resolve:
         return Verdict(True)
 
-    # 解析後檢查**所有**回傳位址 —— 只檢查第一個會被多 A 記錄繞過。
+    # Check *every* resolved address -- inspecting only the first one is
+    # bypassable with multiple A records.
     try:
         infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
     except socket.gaierror as exc:
@@ -99,10 +104,12 @@ def check(url: str, *, resolve: bool = True) -> Verdict:
 
 
 def check_redirect(original: str, final: str | None) -> Verdict:
-    """轉址後重新驗證最終落點。
+    """Re-validate the final destination after redirects.
 
-    上游是否在 redirect 途中重驗,實測沒能確認 (測試在 pre-flight 階段就被擋下,
-    沒進到 redirect 階段)。在確認之前這一層必做:公開網址 302 到私網就是 SSRF。
+    Whether upstream re-validates mid-redirect could not be confirmed by
+    measurement (the test was rejected at the pre-flight stage and never
+    reached the redirect stage). Until that is confirmed this layer is
+    required: a public URL that 302s into a private network is SSRF.
     """
     if not final or final == original:
         return Verdict(True)

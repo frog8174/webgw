@@ -1,13 +1,15 @@
-"""crawl4ai 客戶端。
+"""crawl4ai client.
 
-一律走 /crawl/stream,即使只有一個 URL。
+Always uses /crawl/stream, even for a single URL.
 
-理由是實測:同一個失敗,/crawl 收斂成不透明的 HTTP 500
+The reason is measured. For the same failure, /crawl collapses into an opaque
+HTTP 500:
     {"error":"Internal server error","correlation_id":"37aa5a7a8447"}
-而 /crawl/stream 給出 in-band 的完整資訊
+while /crawl/stream reports the full picture in band:
     {"success":false,"status_code":401,
      "error_message":"Blocked by anti-bot protection: DataDome captcha"}
-指名的協定字串只有 stream 端點拿得到 —— /crawl 那條要去撈容器日誌用 correlation_id 反查。
+Only the stream endpoint names the protection that fired -- on /crawl you would
+have to dig through container logs and look the correlation_id up.
 """
 from __future__ import annotations
 
@@ -19,8 +21,8 @@ import httpx
 
 @dataclass
 class CrawlResult:
-    ok: bool                    # 傳輸層是否成功 (不代表爬取成功)
-    result: dict                # 上游單筆結果
+    ok: bool                    # transport succeeded (not that the crawl did)
+    result: dict                # single upstream result row
     transport_error: str = ""
 
 
@@ -35,8 +37,10 @@ class CrawlClient:
     async def fetch(self, url: str) -> CrawlResult:
         payload = {
             "urls": [url],
-            # 刻意不帶 content_filter。實測 PruningContentFilter 會砍掉文章標題卻留下
-            # 登入元件 (TechNews 的 outline 從 9 節掉到 2 節),fit_markdown 一律不用。
+            # content_filter is deliberately omitted. PruningContentFilter was
+            # measured dropping article headings while keeping login widgets
+            # (one TechNews outline went from 9 sections to 2), so fit_markdown
+            # is never used.
             "crawler_config": {
                 "type": "CrawlerRunConfig",
                 "params": {"page_timeout": int(self._timeout * 1000)},
@@ -59,7 +63,7 @@ class CrawlClient:
                             obj = json.loads(line)
                         except json.JSONDecodeError:
                             continue
-                        # 串流結尾的哨兵行,不是結果。
+                        # End-of-stream sentinel row, not a result.
                         if obj.get("status") == "completed":
                             continue
                         return CrawlResult(True, obj)

@@ -1,8 +1,9 @@
-"""stale 回退路徑。
+"""The stale fallback path.
 
-抓取失敗但快取裡還有保留期內的舊資料時,回舊資料並標記,而不是回錯誤碼。
-理由來自實測:反爬阻擋很常見 (Reuters DataDome / Medium Cloudflare),
-此時一份三天前的內容遠勝於一個 agent 無法使用的錯誤。
+When a fetch fails but an in-retention copy is still cached, the old copy is
+served and flagged rather than returning an error code. The reason is measured:
+anti-bot blocking is common (Reuters via DataDome, Medium via Cloudflare), and
+three-day-old content beats an error the agent cannot use.
 """
 from __future__ import annotations
 
@@ -16,11 +17,13 @@ from webgw.cache import CacheStore
 from webgw.config import Config
 from webgw.crawl_client import CrawlResult
 
+# Deliberately non-ASCII: this fixture also exercises the UTF-8 paths through
+# sectioning, token counting and SQLite storage.
 PAGE = "# 標題\n\n" + ("內容段落。" * 200)
 
 
 class StubClient:
-    """可切換成功/失敗的假上游。"""
+    """Fake upstream that can be switched between success and failure."""
 
     def __init__(self, mode: str = "ok") -> None:
         self.mode = mode
@@ -50,9 +53,11 @@ class StubClient:
 
 @pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
-    """繞過准入層的 DNS 解析 —— 單元測試不該依賴網路。
+    """Bypass the admission layer's DNS resolution -- unit tests must not depend
+    on the network.
 
-    准入邏輯本身由 test_admission.py 以 resolve=False 獨立驗證。
+    The admission logic itself is verified independently in test_admission.py
+    with resolve=False.
     """
     monkeypatch.setattr(pipeline, "CrawlClient", StubClient)
     monkeypatch.setattr(
@@ -91,26 +96,27 @@ async def test_fresh_cache_avoids_upstream_call(cfg, store):
 
     second = await pipeline.fetch("https://e.com/a", None, cfg, client, store)
     assert second["cache"] == "hit"
-    assert client.calls == 1          # 沒有再打上游
+    assert client.calls == 1          # upstream was not called again
 
 
 async def test_stale_served_when_upstream_transport_fails(cfg, store):
     client = StubClient("ok")
     await pipeline.fetch("https://e.com/a", None, cfg, client, store)
 
-    _age_entry(store, 3600)           # 超過 60 秒新鮮度,但遠在 14 天保留期內
+    _age_entry(store, 3600)           # past the 60s freshness, far inside 14-day retention
     client.mode = "transport_fail"
 
     res = await pipeline.fetch("https://e.com/a", None, cfg, client, store)
     assert res["outcome"] == oc.OK
     assert res["cache"] == "stale"
     assert res["cache_age_s"] >= 3600
-    assert "重新抓取失敗" in res["note"]
+    assert "Re-fetch failed" in res["note"]
     assert res["content"] or res["excerpts"]
 
 
 async def test_stale_served_when_site_blocks(cfg, store, monkeypatch):
-    """反爬阻擋時也回舊資料 —— 這是這條路徑最主要的實際用途。"""
+    """Old content is served on anti-bot blocks too -- the main real-world use
+    of this path."""
     monkeypatch.setattr(pipeline, "CrawlClient", StubClient)
     client = StubClient("ok")
     await pipeline.fetch("https://e.com/a", None, cfg, client, store)
@@ -124,7 +130,8 @@ async def test_stale_served_when_site_blocks(cfg, store, monkeypatch):
 
 
 async def test_no_cache_entry_returns_real_error(cfg, store, monkeypatch):
-    """沒有可用舊資料時,必須誠實回報失敗,不能假裝成功。"""
+    """With no usable old copy, the failure must be reported honestly rather
+    than dressed up as success."""
     monkeypatch.setattr(pipeline, "CrawlClient", StubClient)
     client = StubClient("antibot")
 
@@ -135,12 +142,12 @@ async def test_no_cache_entry_returns_real_error(cfg, store, monkeypatch):
 
 
 async def test_expired_beyond_retention_is_not_served_as_stale(cfg, store, monkeypatch):
-    """超過保留期就是不可用,不能再當 stale 回。"""
+    """Past retention the data is gone and must not come back as stale."""
     monkeypatch.setattr(pipeline, "CrawlClient", StubClient)
     client = StubClient("ok")
     await pipeline.fetch("https://e.com/a", None, cfg, client, store)
 
-    _age_entry(store, 15 * 86_400)    # 超過 14 天
+    _age_entry(store, 15 * 86_400)    # past 14 days
     client.mode = "antibot"
 
     res = await pipeline.fetch("https://e.com/a", None, cfg, client, store)

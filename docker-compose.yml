@@ -1,21 +1,28 @@
 services:
   webgw:
     build: .
-    image: webgw:0.3.0
+    image: webgw:0.3.1
     container_name: webgw
     ports:
-      # 本機測試綁 loopback。上線時由 k8s Service (NodePort) 處理對外暴露,
-      # 容器本身仍然只監聽 0.0.0.0:8080。
+      # Bound to loopback for local testing. In production the Kubernetes
+      # Service (NodePort) handles exposure; the container itself still only
+      # listens on 0.0.0.0:8080.
       - "127.0.0.1:8080:8080"
     environment:
-      # 本機測試:crawl4ai 跑在宿主機上,從容器內要走 host.docker.internal。
-      # 之後 crawl4ai 移到區網,改成 http://<區網IP>:11235 即可,程式不用動。
+      # Local testing: crawl4ai runs on the host, so the container reaches it
+      # via host.docker.internal. Once crawl4ai moves to the LAN, change this to
+      # http://<lan-ip>:11235 -- no code changes needed.
       CRAWL4AI_BASE_URL: "${CRAWL4AI_BASE_URL:-http://host.docker.internal:11235}"
-      CRAWL4AI_TOKEN: "${CRAWL4AI_TOKEN:?請在 .env 設定 CRAWL4AI_TOKEN}"
+      CRAWL4AI_TOKEN: "${CRAWL4AI_TOKEN:?set CRAWL4AI_TOKEN in .env}"
       GATEWAY_HOST: "0.0.0.0"
       GATEWAY_PORT: "8080"
-      SELECT_BUDGET_TOKENS: "${SELECT_BUDGET_TOKENS:-4000}"
+      # Measured on a 92k-token page: 4000 failed, 6000 failed, 8000 succeeded.
+      SELECT_BUDGET_TOKENS: "${SELECT_BUDGET_TOKENS:-8000}"
+      # Pages under this size are returned whole, with no selection.
       PASSTHROUGH_MAX_TOKENS: "${PASSTHROUGH_MAX_TOKENS:-4000}"
+      # Largest share of the budget one section may take. At 0.5 a single
+      # section was measured consuming it on its own.
+      MAX_SECTION_FRAC: "${MAX_SECTION_FRAC:-0.35}"
       FETCH_TIMEOUT_S: "${FETCH_TIMEOUT_S:-30}"
       MCP_ALLOWED_HOSTS: "${MCP_ALLOWED_HOSTS:-127.0.0.1,localhost}"
       CACHE_PATH: "/data/cache.sqlite3"
@@ -24,13 +31,25 @@ services:
       CACHE_DOMAIN_RULES: "${CACHE_DOMAIN_RULES:-}"
       CACHE_MAX_BYTES: "${CACHE_MAX_BYTES:-2147483648}"
       CACHE_CLEANUP_INTERVAL_S: "${CACHE_CLEANUP_INTERVAL_S:-3600}"
-      # stateless 會讓客戶端取不到工具清單(實測 OpenCode),保持關閉。
+      # Stateless leaves clients unable to retrieve the tool list (measured with
+      # OpenCode). Keep it off.
       MCP_STATELESS: "${MCP_STATELESS:-0}"
       WEBGW_AUTH_TOKEN: "${WEBGW_AUTH_TOKEN:-}"
+      # Retrieval: bm25 (fast, ~2.5s) | rerank (accurate, ~5-8s).
+      # An empty RERANKER_URL disables reranking; mode=rerank then degrades
+      # automatically to bm25.
+      RETRIEVAL_MODE: "${RETRIEVAL_MODE:-bm25}"
+      RERANKER_URL: "${RERANKER_URL:-}"
+      RERANKER_MODEL: "${RERANKER_MODEL:-bge-reranker-v2-m3}"
+      RERANK_TOP_N: "${RERANK_TOP_N:-30}"
+      RERANK_TIMEOUT_S: "${RERANK_TIMEOUT_S:-15}"
+      # Only for commercial services; leave empty for self-hosted vLLM.
+      RERANKER_API_KEY: "${RERANKER_API_KEY:-}"
       MAX_CONCURRENT_FETCHES: "${MAX_CONCURRENT_FETCHES:-4}"
       RATE_LIMIT_PER_MINUTE: "${RATE_LIMIT_PER_MINUTE:-60}"
     extra_hosts:
-      # Linux 上 host.docker.internal 預設不存在,補上以保持跨平台一致。
+      # host.docker.internal does not exist by default on Linux; this keeps
+      # behaviour consistent across platforms.
       - "host.docker.internal:host-gateway"
     volumes:
       - webgw-cache:/data

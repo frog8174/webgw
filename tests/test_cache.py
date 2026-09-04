@@ -1,4 +1,4 @@
-"""快取層測試:URL 正規化、新鮮度、保留期清理、LRU 淘汰。"""
+"""Cache layer: URL normalization, freshness, retention cleanup, LRU eviction."""
 from __future__ import annotations
 
 import time
@@ -21,7 +21,7 @@ def store(tmp_path):
     )
 
 
-# ── URL 正規化 ────────────────────────────────────────────────────
+# -- URL normalization -------------------------------------------------------
 def test_tracking_params_stripped():
     a = normalize_url("https://Example.com/a?utm_source=x&id=7&fbclid=zz")
     assert a == "https://example.com/a?id=7"
@@ -36,11 +36,12 @@ def test_default_port_normalised():
 
 
 def test_trailing_slash_is_significant():
-    """/a 與 /a/ 在部分站台是不同頁面,刻意不合併。"""
+    """On some sites /a and /a/ are different pages, so they are deliberately
+    not merged."""
     assert cache_key("https://e.com/a") != cache_key("https://e.com/a/")
 
 
-# ── 新鮮度 ────────────────────────────────────────────────────────
+# -- freshness ---------------------------------------------------------------
 def test_domain_rule_overrides_default(store):
     assert store.max_age_for("https://technews.tw/2026/08/x") == 3600
     assert store.max_age_for("https://other.com/x") == DAY
@@ -51,21 +52,22 @@ def test_subdomain_matches_longest_rule_first(store):
 
 
 def test_max_age_capped_by_retention(tmp_path):
-    """新鮮度超過保留期是無意義設定 —— 資料會先被刪掉,永遠等不到過期。"""
+    """Freshness beyond retention is a meaningless setting -- the row is deleted
+    first, so it never gets the chance to go stale."""
     s = CacheStore(
         str(tmp_path / "c.sqlite3"),
         retention_days=14,
-        domain_rules={"docs.site": 30 * DAY},   # 30 天 > 14 天保留期
+        domain_rules={"docs.site": 30 * DAY},   # 30 days > the 14-day retention
     )
     assert s.max_age_for("https://docs.site/x") == 14 * DAY
 
 
-# ── 讀寫 ──────────────────────────────────────────────────────────
+# -- read and write ----------------------------------------------------------
 @pytest.mark.asyncio
 async def test_put_then_get_roundtrip(store):
     await store.put("https://e.com/a", markdown="# hi", raw_tokens=3, status_code=200,
                     final_url="https://e.com/a", title="T")
-    got = await store.get("https://e.com/a?utm_source=news")   # 正規化後同一筆
+    got = await store.get("https://e.com/a?utm_source=news")   # same row after normalization
     assert got is not None and got.markdown == "# hi" and got.title == "T"
 
 
@@ -84,17 +86,17 @@ def test_freshness_boundary(store):
     assert stale.is_fresh(DAY) is False
 
 
-# ── 清理 ──────────────────────────────────────────────────────────
+# -- cleanup -----------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_retention_deletes_old_rows(store):
     await store.put("https://e.com/old", markdown="x" * 100, raw_tokens=1)
-    # 手動把 fetched_at 推到 15 天前 (超過 14 天保留期)
+    # Push fetched_at back 15 days, past the 14-day retention.
     conn = store._connect()
     conn.execute("UPDATE pages SET fetched_at=?", (int(time.time()) - 15 * DAY,))
     conn.commit()
     conn.close()
 
-    assert await store.get("https://e.com/old") is None      # 立即視同不存在
+    assert await store.get("https://e.com/old") is None      # immediately treated as absent
     stats = await store.cleanup()
     assert stats["expired"] == 1 and stats["remaining"] == 0
 
@@ -108,10 +110,11 @@ async def test_retention_keeps_recent_rows(store):
 
 @pytest.mark.asyncio
 async def test_lru_eviction_on_size_cap(store):
-    """只靠時間清理擋不住暴衝的爬取量,容量上限必須並存。"""
+    """Time-based cleanup alone does not hold back a burst of crawling, so the
+    size ceiling has to work alongside it."""
     for i in range(6):
         await store.put(f"https://e.com/{i}", markdown="y" * 3000, raw_tokens=1)
-    # 讓第 0 筆變成最近使用,它應該存活
+    # Touch row 0 so it becomes most recently used; it should survive.
     await store.get("https://e.com/0")
 
     stats = await store.cleanup()

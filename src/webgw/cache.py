@@ -1,16 +1,19 @@
-"""raw markdown 快取。
+"""Raw markdown cache.
 
-存 raw 而非 fit:換 query 重查同一頁不需重爬,且 fit_markdown 實測不可信
-(PruningContentFilter 會砍掉文章標題卻留下登入元件)。
+Stores raw rather than fit markdown: re-querying the same page with a different
+query then needs no re-crawl, and fit_markdown was measured untrustworthy
+(PruningContentFilter drops article headings while keeping login widgets).
 
-三層時間語意 —— 不要混為一談:
-  max_age    (新鮮度) 超過就重抓。逐網域可調。
-  retention  (保留期) 超過就刪除,資料不再可用。預設 14 天。
-  stale      介於兩者之間、且重抓失敗時,回舊資料並標記 —— 實測反爬阻擋很常見
-             (Reuters/Medium),此時一份三天前的內容遠勝於一個錯誤碼。
+Three time semantics, which must not be conflated:
+    max_age    freshness -- past this the page is re-fetched. Per-domain.
+    retention  past this the row is deleted and the data is gone. 14 days.
+    stale      between the two, when a re-fetch fails, the old copy is returned
+               and flagged. Anti-bot blocking is common (Reuters, Medium), and
+               three-day-old content beats an error code by a wide margin.
 
-容量上限與時間清理必須並存。只有時間限制擋不住暴衝的爬取量 —— 上游 crawl4ai
-自己的 SQLite 就是「無 TTL、無容量上限,長到磁碟滿」的反例。
+The size ceiling and the time-based cleanup must coexist. Time limits alone do
+not hold back a burst of crawling -- upstream crawl4ai's own SQLite is the
+counterexample: no TTL, no size cap, grows until the disk fills.
 """
 from __future__ import annotations
 
@@ -25,7 +28,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 log = logging.getLogger("webgw.cache")
 
-# 追蹤參數:不影響頁面內容,但會讓同一頁存成多份,拖垮命中率。
+# Tracking parameters: they do not change page content, but they do store the
+# same page many times over and wreck the hit rate.
 _TRACKING_PREFIXES = ("utm_", "pk_", "mtm_", "matomo_")
 _TRACKING_EXACT = {
     "fbclid", "gclid", "dclid", "msclkid", "igshid", "mc_cid", "mc_eid",
@@ -36,7 +40,11 @@ _DEFAULT_PORTS = {"http": "80", "https": "443"}
 
 
 def normalize_url(url: str) -> str:
-    """正規化以提高命中率。保守處理:只動確定無語意的部分。"""
+    """Normalize to raise the hit rate.
+
+    Deliberately conservative: only parts with no possible semantic meaning are
+    touched.
+    """
     parts = urlsplit(url.strip())
     scheme = parts.scheme.lower()
     host = (parts.hostname or "").lower()
@@ -51,12 +59,13 @@ def normalize_url(url: str) -> str:
         if k.lower() not in _TRACKING_EXACT
         and not any(k.lower().startswith(p) for p in _TRACKING_PREFIXES)
     ]
-    # 排序讓參數順序不同的同一頁能命中同一筆。
+    # Sorting lets the same page hit one row regardless of parameter order.
     query = urlencode(sorted(query_pairs), doseq=True)
 
     path = parts.path or "/"
-    # 刻意不去掉尾斜線:部分站台 /a 與 /a/ 是不同頁面。
-    # fragment 一律丟棄 —— 它不會送到伺服器,對內容沒有影響。
+    # Trailing slashes are deliberately kept: on some sites /a and /a/ are
+    # different pages. The fragment is always dropped -- it never reaches the
+    # server and cannot affect content.
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
@@ -93,8 +102,9 @@ CREATE TABLE IF NOT EXISTS pages (
     raw_tokens   INTEGER NOT NULL,
     status_code  INTEGER,
     fetched_at   INTEGER NOT NULL,
-    -- REAL 而非 INTEGER:整秒精度會讓同一秒內的存取全部同分,
-    -- ORDER BY 退化成任意順序,LRU 形同失效。
+    -- REAL, not INTEGER: whole-second precision ties every access within the
+    -- same second, ORDER BY degenerates into arbitrary order, and LRU stops
+    -- working entirely.
     last_hit_at  REAL NOT NULL,
     hits         INTEGER NOT NULL DEFAULT 0,
     nbytes       INTEGER NOT NULL
@@ -122,7 +132,7 @@ class CacheStore:
         self._janitor: asyncio.Task | None = None
         self._init_db()
 
-    # ── 連線 ────────────────────────────────────────────────────────
+    # -- connection --------------------------------------------------------
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=10)
         conn.execute("PRAGMA journal_mode=WAL")
@@ -136,30 +146,33 @@ class CacheStore:
             os.makedirs(parent, exist_ok=True)
         conn = self._connect()
         try:
-            # auto_vacuum 必須在建表**之前**設定,否則對既有資料庫不生效。
-            # 沒有它,DELETE 不會把空間還給作業系統,檔案只會單向長大。
+            # auto_vacuum must be set *before* the tables are created; it has no
+            # effect on an existing database. Without it, DELETE never returns
+            # space to the OS and the file only ever grows.
             conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
             conn.executescript(_SCHEMA)
             conn.commit()
         finally:
             conn.close()
 
-    # ── 新鮮度 ──────────────────────────────────────────────────────
+    # -- freshness ---------------------------------------------------------
     def max_age_for(self, url: str) -> int:
-        """逐網域新鮮度,並夾在保留期以內。
+        """Per-domain freshness, clamped to the retention period.
 
-        max_age 超過保留期是無意義的設定 —— 資料會先被刪掉,永遠等不到過期。
+        A max_age beyond retention is a meaningless setting -- the row is
+        deleted first, so it never gets the chance to go stale.
         """
         host = (urlsplit(url).hostname or "").lower()
         max_age = self.default_max_age_s
-        # 由最長後綴開始比對,讓 docs.example.com 的規則優先於 example.com。
+        # Match longest suffix first so a rule for docs.example.com wins over
+        # one for example.com.
         for domain, secs in sorted(self.domain_rules.items(), key=lambda kv: -len(kv[0])):
             if host == domain or host.endswith("." + domain):
                 max_age = secs
                 break
         return min(max_age, self.retention_s)
 
-    # ── 讀寫 ────────────────────────────────────────────────────────
+    # -- read and write ----------------------------------------------------
     def _get_sync(self, key: str) -> CacheEntry | None:
         conn = self._connect()
         try:
@@ -171,7 +184,8 @@ class CacheStore:
             if row is None:
                 return None
             now = int(time.time())
-            # 超過保留期的資料視同不存在(實際刪除留給下一輪清理)。
+            # Rows past retention are treated as absent; the actual delete is
+            # left to the next cleanup pass.
             if now - row[6] > self.retention_s:
                 return None
             conn.execute(
@@ -215,7 +229,7 @@ class CacheStore:
     async def put(self, url: str, **entry) -> None:
         await asyncio.to_thread(self._put_sync, cache_key(url), normalize_url(url), entry)
 
-    # ── 清理 ────────────────────────────────────────────────────────
+    # -- cleanup -----------------------------------------------------------
     def _cleanup_sync(self) -> dict:
         now = int(time.time())
         conn = self._connect()
@@ -225,7 +239,8 @@ class CacheStore:
             )
             expired = cur.rowcount
 
-            # 容量上限:依 last_hit_at 由舊到新淘汰 (LRU),直到低於上限。
+            # Size ceiling: evict least recently used first, by last_hit_at,
+            # until back under the limit.
             total = conn.execute("SELECT COALESCE(SUM(nbytes),0) FROM pages").fetchone()[0]
             evicted = 0
             if total > self.max_bytes:
@@ -240,7 +255,7 @@ class CacheStore:
                     evicted += 1
             conn.commit()
 
-            # DELETE 之後要回收空間,否則檔案只會單向長大。
+            # Space has to be reclaimed after DELETE, or the file only grows.
             if expired or evicted:
                 conn.execute("PRAGMA incremental_vacuum")
                 conn.commit()
@@ -256,14 +271,14 @@ class CacheStore:
     async def cleanup(self) -> dict:
         stats = await asyncio.to_thread(self._cleanup_sync)
         log.info(
-            "cache cleanup: 過期刪除=%d LRU淘汰=%d 剩餘=%d 佔用=%.1fMB",
+            "cache cleanup: expired=%d evicted=%d remaining=%d size=%.1fMB",
             stats["expired"], stats["evicted"], stats["remaining"],
             stats["bytes"] / 1024 / 1024,
         )
         return stats
 
     def start_janitor(self, interval_s: int) -> None:
-        """啟動週期清理。重複呼叫不會重複啟動。"""
+        """Start periodic cleanup. Calling this again is a no-op."""
         if self._janitor is not None and not self._janitor.done():
             return
 
@@ -272,14 +287,14 @@ class CacheStore:
                 try:
                     await self.cleanup()
                 except Exception:  # noqa: BLE001
-                    log.exception("cache cleanup 失敗,下一輪重試")
+                    log.exception("cache cleanup failed, retrying next cycle")
                 await asyncio.sleep(interval_s)
 
         try:
             self._janitor = asyncio.get_running_loop().create_task(_loop())
             log.info(
-                "cache janitor 已啟動,間隔 %ds,保留期 %d 天",
+                "cache janitor started, interval %ds, retention %d days",
                 interval_s, self.retention_s // 86_400,
             )
         except RuntimeError:
-            log.warning("沒有執行中的 event loop,janitor 未啟動")
+            log.warning("no running event loop; janitor not started")

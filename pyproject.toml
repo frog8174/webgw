@@ -1,6 +1,6 @@
 [project]
 name = "webgw"
-version = "0.3.0"
+version = "0.3.1"
 description = "Query-aware web fetch gateway for local LLM agents (OpenCode / MCP)"
 requires-python = ">=3.11"
 dependencies = [
@@ -8,7 +8,8 @@ dependencies = [
     "httpx>=0.27",
     "tiktoken>=0.7",
     "uvicorn>=0.30",
-    # 繁簡正規化。實測 12 個中文案例:改善 4、持平 8、變差 0。
+    # Traditional/Simplified normalization. Measured across 12 Chinese cases:
+    # 4 improved, 8 unchanged, 0 regressed.
     "opencc-python-reimplemented>=0.1.7",
 ]
 

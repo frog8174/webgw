@@ -1,9 +1,10 @@
-# crawl4ai 上游服務。ClusterIP only —— 不對叢集外暴露。
+# Upstream crawl4ai service. ClusterIP only -- never exposed outside the cluster.
 #
-# 它沒有認證、沒有 SSRF 准入檢查、也沒有限流(啟動日誌:per_principal=unlimited),
-# 這三樣都在 webgw 那一層。所以它只該被 webgw 連到。
+# It has no authentication, no SSRF admission checks and no rate limiting
+# (startup log: per_principal=unlimited). All three live in the webgw layer, so
+# only webgw should ever reach this.
 #
-# 使用前必改:Secret 裡的兩個值。
+# Change before use: both values in the Secret.
 ---
 apiVersion: v1
 kind: Secret
@@ -11,11 +12,11 @@ metadata:
   name: crawl4ai-secrets
 type: Opaque
 stringData:
-  # 沒設這個的話,0.9.2 只綁容器內 loopback,readiness 探針會一直失敗、
-  # Pod 永遠不會 Ready、Service 也就沒有 endpoint。
+  # Without this, 0.9.2 binds only the container's loopback: the readiness probe
+  # fails forever, the pod never becomes Ready, and the Service gets no endpoint.
   api-token: "CHANGE_ME"
-  # 必須 >= 32 字元,否則 gunicorn worker 每兩秒崩潰一次。
-  # 產生:openssl rand -hex 32
+  # Must be >= 32 characters, or the gunicorn worker crashes every two seconds.
+  # Generate with: openssl rand -hex 32
   secret-key: "CHANGE_ME_AT_LEAST_32_CHARACTERS_LONG"
 ---
 apiVersion: apps/v1
@@ -30,24 +31,28 @@ spec:
     metadata:
       labels: { app: crawl4ai }
     spec:
-      # 關掉 k8s 自動注入的 Service 環境變數。
+      # Disable the Service environment variables Kubernetes injects.
       #
-      # k8s 沿用 Docker 早期行為:namespace 裡每有一個 Service,就替每個 Pod
-      # 注入一組 <SERVICE_NAME>_PORT 之類的變數。Service 叫 crawl4ai 時會注入
+      # Kubernetes inherits early Docker behaviour: for every Service in the
+      # namespace it injects a set of <SERVICE_NAME>_PORT style variables into
+      # every pod. With a Service named crawl4ai that means
       #   CRAWL4AI_PORT=tcp://10.x.x.x:11235
-      # 而 crawl4ai 這支程式自己也用 CRAWL4AI_PORT 決定監聽埠 —— 被蓋掉之後
-      # gunicorn 拿這個 URL 當埠號解析,啟動即崩潰:
+      # and crawl4ai itself uses CRAWL4AI_PORT to choose its listening port. Once
+      # overwritten, gunicorn parses that URL as a port number and dies at
+      # startup:
       #   Error: 'tcp://10.105.110.45:11235' is not a valid port number.
       #
-      # 這只影響環境變數注入,DNS 不受影響 —— http://crawl4ai:11235 照常可用。
+      # This affects environment injection only; DNS is untouched, so
+      # http://crawl4ai:11235 keeps working.
       enableServiceLinks: false
       containers:
         - name: crawl4ai
-          # 標籤 + digest 兩個都寫:標籤負責可讀性,digest 負責不可變。
-          # 實際拉取以 digest 為準,標籤被重新發布也不受影響。
+          # Tag and digest together: the tag is readable, the digest is
+          # immutable. The pull follows the digest, so republishing the tag
+          # cannot change what runs.
           #
-          # 不要只寫 :latest —— 實測 2026-09-01 時 :latest 已經從這個 digest
-          # 移動到 sha256:84751dab...,寫 :latest 會拉到未經測試的版本。
+          # Do not use :latest -- as of 2026-09-01 :latest had already moved off
+          # this digest to sha256:84751dab..., so :latest pulls an untested build.
           image: unclecode/crawl4ai:0.9.2
           imagePullPolicy: IfNotPresent
           ports:
@@ -62,27 +67,31 @@ spec:
             - name: CRAWL4AI_HOOKS_ENABLED
               value: "false"
           volumeMounts:
-            # Chromium 需要共享記憶體。容器預設的 /dev/shm 只有 64MB,
-            # 分頁會隨機崩潰 —— 這是 k8s 上最常見的 headless 瀏覽器故障。
-            # docker run 用 --shm-size=1g,k8s 要靠這個 emptyDir 達成。
+            # Chromium needs shared memory. A container's default /dev/shm is
+            # only 64MB, which makes tabs crash at random -- the most common
+            # headless browser failure on Kubernetes. `docker run` solves it with
+            # --shm-size=1g; on Kubernetes it takes this emptyDir.
             - name: dshm
               mountPath: /dev/shm
-          # startupProbe 專門給啟動慢的容器。在它通過之前,readiness 與 liveness
-          # 都不會作用 —— 這樣既給足啟動時間,又不必放寬 liveness 的閾值
-          # (放寬會讓真正掛掉時的偵測變慢)。
+          # startupProbe exists for slow-starting containers. Until it passes,
+          # neither readiness nor liveness runs -- which grants ample startup
+          # time without loosening the liveness thresholds (loosening those
+          # would slow down detection of a genuine hang).
           #
-          # crawl4ai 的啟動流程:redis -> gunicorn -> 建立 Playwright 瀏覽器池
-          # (日誌會出現「Creating permanent default browser」)。冷啟動可能要一兩分鐘。
-          # 30 次 x 10 秒 = 最多容忍 5 分鐘。
+          # crawl4ai's startup sequence: redis -> gunicorn -> building the
+          # Playwright browser pool (the log shows "Creating permanent default
+          # browser"). A cold start can take a minute or two.
+          # 30 x 10s tolerates up to 5 minutes.
           startupProbe:
             httpGet: { path: /health, port: 11235 }
             initialDelaySeconds: 15
             periodSeconds: 10
             failureThreshold: 30
           readinessProbe:
-            # 從 Pod IP 打,不是從容器內 localhost 打 —— 這點很重要:
-            # 映像自帶的 HEALTHCHECK 是內部 curl localhost,服務只綁 loopback
-            # 時它照樣通過。k8s 探針從外部打,才驗得到真正的可達性。
+            # Probed at the pod IP, not from localhost inside the container, and
+            # that distinction matters: the image's built-in HEALTHCHECK curls
+            # localhost, so it passes even when the service is bound to loopback
+            # only. Probing from outside is what actually verifies reachability.
             httpGet: { path: /health, port: 11235 }
             periodSeconds: 10
             failureThreshold: 3
@@ -92,24 +101,27 @@ spec:
             failureThreshold: 3
           resources:
             requests: { cpu: "500m", memory: "2Gi" }
-            # 映像的健康檢查會在可用記憶體 < 2GB 時警告。
-            # /dev/shm 的 emptyDir 計入這個上限,所以 4Gi 實際可用約 3Gi。
+            # The image's health check warns when available memory drops below
+            # 2GB. The /dev/shm emptyDir counts against this limit, so 4Gi leaves
+            # roughly 3Gi usable.
             limits:   { cpu: "2000m", memory: "4Gi" }
       volumes:
         - name: dshm
           emptyDir:
             medium: Memory
             sizeLimit: 1Gi
-      # 刻意不掛持久卷。crawl4ai 自己的 SQLite 快取沒有 TTL、沒有容量上限,
-      # 會一直長到磁碟滿。不持久化反而避開這個問題 ——
-      # 持久化由 webgw 那層負責(14 天保留期 + 2GB 上限 + LRU 淘汰)。
+      # No persistent volume, deliberately. crawl4ai's own SQLite cache has no
+      # TTL and no size cap and grows until the disk fills; not persisting it
+      # sidesteps that entirely. Persistence is webgw's job (14-day retention,
+      # 2GB ceiling, LRU eviction).
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: crawl4ai
 spec:
-  # ClusterIP:只有叢集內連得到。webgw 用 http://crawl4ai:11235 存取。
+  # ClusterIP: reachable only from inside the cluster. webgw uses
+  # http://crawl4ai:11235.
   type: ClusterIP
   selector: { app: crawl4ai }
   ports:

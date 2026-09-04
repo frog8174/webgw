@@ -1,8 +1,13 @@
-"""章節切分與目錄偵測。
+"""Section splitting and table-of-contents detection.
 
-目錄偵測的動機來自中文驗證:中文維基查「自注意力機制的背景」時,「目录」排第 2、
-真正的答案排第 5 —— 目錄含有全頁標題,對任何查詢都高分,卻沒有任何內容。
-加入偵測後,同字集查詢的 rank@1 從 6/11 升到 11/11。
+TOC detection came out of the Chinese validation set: on Chinese Wikipedia, a
+query about the background of self-attention put the TOC 2nd and the real answer
+5th -- a TOC contains every heading on the page, so it scores highly against any
+query while carrying no content. Adding detection moved same-script rank@1 from
+6/11 to 11/11.
+
+The Chinese strings below are test data, not prose: TOC detection has to work
+without any language-specific keywords, and these cases are what proves it.
 """
 from __future__ import annotations
 
@@ -24,21 +29,23 @@ def test_index_section_detected_by_structure():
 
 
 def test_toc_with_leading_numbers_still_detected():
-    """維基目錄項帶編號(「1 背景」)而標題是「背景」,正規化要能對上。"""
+    """Wikipedia TOC entries carry numbers ("1 Background") where the heading
+    does not, so normalization has to bring them together."""
     titles = ["背景", "架構", "訓練", "應用"]
     body = _toc([f"{i} {t}" for i, t in enumerate(titles, 1)])
     assert sections.is_index_section(body, [sections._norm_title(t) for t in titles]) is True
 
 
 def test_prose_section_with_links_is_not_index():
-    """論文的交叉引用章節不可被誤判 —— ar5iv 的「6.1 Machine Translation」曾中招。"""
+    """Cross-reference sections in papers must not be misclassified -- ar5iv's
+    "6.1 Machine Translation" was caught by an earlier version."""
     titles = ["1 introduction", "6.1 machine translation", "5.3 optimizer"]
     body = _prose("translation") + "\n[Table 2](#t2) [Section 3](#s3)"
     assert sections.is_index_section(body, titles) is False
 
 
 def test_link_heavy_section_without_heading_coverage_is_not_index():
-    """全是連結但不覆蓋標題的(例如相關文章清單),不是目錄。"""
+    """All links but no heading coverage (a related-articles list, say) is not a TOC."""
     body = _toc(["其他文章一", "其他文章二", "其他文章三"])
     assert sections.is_index_section(body, ["背景", "架構", "訓練"]) is False
 
@@ -56,12 +63,13 @@ def test_split_drops_index_section():
 
 
 def test_title_truncation_is_display_only():
-    """標題行不在 body 裡,若在切分時截斷會讓超出的文字永久消失於索引之外。"""
+    """The heading line is not part of the body, so truncating at split time
+    would hide the overflow from the index permanently."""
     long_title = "A" * 300
     md = f"## {long_title}\n" + _prose("content")
     sec = sections.split(md)[0]
-    assert len(sec.title) == 300                                   # 檢索用完整標題
-    assert len(sec.display_title) == sections.TITLE_DISPLAY_CHARS   # 顯示用截斷
+    assert len(sec.title) == 300                                   # full title for retrieval
+    assert len(sec.display_title) == sections.TITLE_DISPLAY_CHARS   # truncated for display
     assert len(sec.as_outline_entry()["title"]) == sections.TITLE_DISPLAY_CHARS
 
 
@@ -78,9 +86,11 @@ def test_section_tokens_recorded():
 
 
 def test_stateless_defaults_off(monkeypatch):
-    """stateless 時伺服器不發 Mcp-Session-Id,實測 OpenCode 會取不到工具清單。
+    """Stateless issues no Mcp-Session-Id, and OpenCode was measured unable to
+    retrieve the tool list as a result.
 
-    預設必須關閉 —— 快取是 SQLite 單檔、replicas 鎖在 1,stateless 換不到擴展性。
+    It must default to off: the cache is a single SQLite file with replicas
+    pinned to 1, so stateless buys no scalability in exchange.
     """
     import importlib
 
@@ -98,11 +108,13 @@ def test_stateless_defaults_off(monkeypatch):
 
 
 async def test_get_mcp_returns_405_but_other_paths_pass():
-    """GET /mcp 必須回 405,其餘路徑不受影響。
+    """GET /mcp must answer 405, and every other path must be unaffected.
 
-    那條 SSE 串流是選用的伺服器→客戶端推送通道,本服務從不推送。
-    SDK 預設回 200 並永久佔住一條 HTTP/1.1 連線,實測會讓 OpenCode 約半數
-    連線卡死(tools/list 排在串流後面,永遠送不出去)。
+    That SSE stream is the optional server-to-client push channel, which this
+    service never uses. The SDK's default answers 200 and occupies an HTTP/1.1
+    connection indefinitely, which was measured stalling about half of
+    OpenCode's connections -- tools/list queued behind the stream and never got
+    sent.
     """
     from webgw.server import DenyStandaloneGet
 
@@ -118,15 +130,15 @@ async def test_get_mcp_returns_405_but_other_paths_pass():
 
     wrapped = DenyStandaloneGet(inner)
 
-    # GET /mcp -> 405,不進入內層
+    # GET /mcp -> 405, never reaching the inner app
     await wrapped({"type": "http", "method": "GET", "path": "/mcp"}, None, send)
     assert sent[0]["status"] == 405
     assert ("passed_through" in seen) is False
 
-    # POST /mcp -> 放行
+    # POST /mcp -> passes through
     await wrapped({"type": "http", "method": "POST", "path": "/mcp"}, None, send)
     assert seen["passed_through"] == "/mcp"
 
-    # GET /healthz -> 放行 (探針不能被擋掉)
+    # GET /healthz -> passes through (probes must not be blocked)
     await wrapped({"type": "http", "method": "GET", "path": "/healthz"}, None, send)
     assert seen["passed_through"] == "/healthz"

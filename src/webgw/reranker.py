@@ -1,17 +1,26 @@
-"""Cross-encoder 重排客戶端。
+"""Cross-encoder reranking client.
 
-為什麼用 cross-encoder 而不是 embedding:query 和段落**一起**送進模型,
-模型看得到兩者的互動,比分別編碼再算相似度準得多。而且不需要存或比對向量。
+Why a cross-encoder rather than embeddings: the query and the passage go into
+the model *together*, so it sees their interaction. That is markedly more
+accurate than encoding each separately and comparing vectors, and it needs no
+vector store.
 
-為什麼是兩階段:不對整頁重排。BM25 先取前 N 名(毫秒級、不用 GPU),
-只把這 N 段送給模型。一頁常有 20~200 節,差 6 倍以上的工作量。
+Why two stages: the whole page is never reranked. BM25 picks the top N first
+(milliseconds, no GPU), and only those go to the model. Pages commonly hold
+20-200 sections, so this is a 6x or larger difference in model work.
 
-實測 (30 個案例,bge-reranker-v2-m3 on vLLM):
-    BM25 + t2s          rank@1 24/30
-    再加上重排           rank@1 28/30    中位 +3 秒
+Measured on 30 cases with bge-reranker-v2-m3 on vLLM:
+    BM25 + script normalization    rank@1 24/30
+    plus reranking                 rank@1 28/30    median +3 seconds
 
-多修好的 5 個全是「字面不匹配但語意相關」—— BM25 的方法邊界。
-代價是延遲從 2.4 秒變成 5~8 秒,所以預設不開,由 mode 決定。
+All 5 additional fixes were "no literal overlap but semantically related",
+which is the boundary of the BM25 method. The cost is latency going from about
+2.4 seconds to 5-8, so this is off by default and selected per call via `mode`.
+
+Wire format: the request and response match the Cohere rerank API, which Jina
+and others also implement, so a self-hosted vLLM endpoint and a commercial
+service are interchangeable. The only difference is authentication -- set
+api_key for commercial providers, leave it empty for self-hosted.
 """
 from __future__ import annotations
 
@@ -25,7 +34,10 @@ log = logging.getLogger("webgw.reranker")
 
 
 class RerankUnavailable(Exception):
-    """重排服務不可用。呼叫端據此降級回 BM25,而不是讓整個請求失敗。"""
+    """Reranking service is unusable.
+
+    Callers degrade to BM25 on this rather than failing the whole request.
+    """
 
 
 class RerankClient:
@@ -36,22 +48,40 @@ class RerankClient:
         *,
         timeout_s: float = 10.0,
         doc_chars: int = 2000,
+        api_key: str = "",
     ) -> None:
         self._base = base_url.rstrip("/")
         self._model = model
         self._timeout = timeout_s
-        # 單段送出的字元上限。cross-encoder 是把 query 和 document 接在一起
-        # 送進去,超過 max_model_len 的部分會被截掉 —— 可能截掉答案所在處。
+        # Character cap per passage. A cross-encoder concatenates query and
+        # document before encoding, and anything past max_model_len is cut --
+        # possibly cutting off where the answer sits.
         self._doc_chars = doc_chars
+        # Self-hosted endpoints usually have no auth; commercial ones always do.
+        # Left empty, the header is not sent at all.
+        self._api_key = api_key
 
     @property
     def configured(self) -> bool:
         return bool(self._base and self._model)
 
-    async def order(self, query: str, documents: list[str]) -> list[int]:
-        """回傳依相關性排序後的索引。失敗時丟 RerankUnavailable。"""
+    def _headers(self) -> dict[str, str]:
+        h = {"Content-Type": "application/json"}
+        if self._api_key:
+            h["Authorization"] = f"Bearer {self._api_key}"
+        return h
+
+    async def order(self, query: str, documents: list[str]) -> list[tuple[int, float]]:
+        """Return [(index, relevance_score), ...], most relevant first.
+
+        The scores must come back with the indices. Without them the caller can
+        only reuse BM25's statistics, so the reported match.confidence would
+        describe how certain *BM25* was rather than the reranker -- measured
+        making both modes report identical numbers while selecting different
+        sections.
+        """
         if not self.configured:
-            raise RerankUnavailable("reranker 未設定")
+            raise RerankUnavailable("reranker not configured")
         if not documents:
             return []
 
@@ -66,10 +96,10 @@ class RerankClient:
                 resp = await client.post(
                     f"{self._base}/v1/rerank",
                     json=payload,
-                    headers={"Content-Type": "application/json"},
+                    headers=self._headers(),
                 )
         except httpx.TimeoutException as exc:
-            raise RerankUnavailable(f"逾時 ({self._timeout}s)") from exc
+            raise RerankUnavailable(f"timeout ({self._timeout}s)") from exc
         except httpx.HTTPError as exc:
             raise RerankUnavailable(f"{type(exc).__name__}: {str(exc)[:120]}") from exc
 
@@ -79,21 +109,26 @@ class RerankClient:
         try:
             results = resp.json()["results"]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise RerankUnavailable(f"回應格式不符: {resp.text[:120]}") from exc
+            raise RerankUnavailable(f"unexpected response shape: {resp.text[:120]}") from exc
 
-        order = [r["index"] for r in results if isinstance(r.get("index"), int)]
-        # 服務可能只回前 N 名。把沒回到的補在後面,確保不遺失任何段落。
-        seen = set(order)
-        order.extend(i for i in range(len(documents)) if i not in seen)
-        log.info("rerank %d 段,耗時 %dms", len(documents), int((time.time() - t0) * 1000))
-        return order
+        scored = [
+            (r["index"], float(r.get("relevance_score", 0.0)))
+            for r in results
+            if isinstance(r.get("index"), int)
+        ]
+        # The service may return only the top N. Anything missing is appended
+        # with a score of 0 so no section is lost.
+        seen = {i for i, _ in scored}
+        scored.extend((i, 0.0) for i in range(len(documents)) if i not in seen)
+        log.info("reranked %d sections in %dms", len(documents), int((time.time() - t0) * 1000))
+        return scored
 
     async def healthy(self) -> bool:
         if not self.configured:
             return False
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                r = await client.get(f"{self._base}/v1/models")
+                r = await client.get(f"{self._base}/v1/models", headers=self._headers())
             return r.status_code == 200
         except httpx.HTTPError:
             return False
