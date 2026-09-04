@@ -12,6 +12,21 @@ web_fetch(url="https://example.com/release-notes", query="breaking changes in 2.
      plus the outline of what was left out, and how much it would cost
 ```
 
+## Built against
+
+| Component | Version | Notes |
+|---|---|---|
+| **crawl4ai** | **0.9.2** | Pinned by digest in `deploy/crawl4ai.yaml`. Not `:latest` — as of 2026-09-01 that tag had already moved to an untested build |
+| MCP protocol | `2025-11-25` | Streamable HTTP transport |
+| `mcp` Python SDK | `>=2.0` (tested on 2.1.1) | 2.x renamed `FastMCP` to `MCPServer`; host/port/stateless moved into `run()` |
+| Python | `>=3.11` | Image ships 3.12 |
+
+Several behaviours here are calibrated against **crawl4ai 0.9.2 specifically** and
+should be re-checked when upgrading: it returns `success=True` for 404 pages, it
+binds container loopback when `CRAWL4AI_API_TOKEN` is unset, its
+`PruningContentFilter` drops article headings, and `/crawl` collapses anti-bot
+blocks into an opaque HTTP 500 while `/crawl/stream` names them.
+
 ## Why
 
 Local models typically have 8k–32k of context. The median web page is
@@ -30,6 +45,48 @@ tell whether the answer might be elsewhere and ask again.
 
 *30 ground-truth cases: 12 English, 18 Chinese. rank@1 counts how often the
 correct section ranked first.*
+
+## What it actually does
+
+Real calls against a deployed instance, 2026-09-04. Every number below is
+measured, not illustrative.
+
+| Case | `outcome` | raw → returned | `mode` | confidence | time |
+|---|---|---|---|---|---|
+| Small page, no query | `ok` | 33 → 33 | `passthrough` | — | — |
+| Large page + query | `ok` | 89,847 → **6,353** | `bm25` | medium | 0.7 s |
+| Same page, `mode="rerank"` | `ok` | 89,847 → **7,000** | `rerank` | **high** | 8.3 s |
+| Traditional query, Simplified page | `ok` | 52,196 → **5,263** | `bm25` | medium | 1.7 s |
+| GitHub 404 | `not_found` | — | — | — | 2.7 s |
+| arXiv PDF | `unsupported_content` | — | — | — | **10 ms** |
+| Cloud metadata IP | `blocked_url` | — | — | — | **10 ms** |
+| Query matches nothing | `ok` | 9,012 → 7,704 | `document_order` | none | 0.3 s |
+
+*Fetch times are with a warm cache; a cold fetch of a large page is 2–6 s. The
+two 10 ms rows never reach the network — admission rejects them before dispatch.*
+
+### The two-pass workflow, on one page
+
+Same URL, same query — `how does multi-head attention work` on the Transformer
+article (89,847 raw tokens):
+
+| | top-ranked section | confidence | time |
+|---|---|---|---|
+| `mode="bm25"` | "Subsequent work" | medium (5.53) | 0.7 s |
+| `mode="rerank"` | **"Multi-Query Attention"** | high (0.97) | 8.3 s |
+
+BM25 put a section that merely mentions attention first; the cross-encoder found
+the section actually about the mechanism. This is the case `mode="rerank"` exists
+for — and because raw content is cached, the retry cost only the reranking, not
+another crawl.
+
+### Where it does not help much
+
+The `document_order` row above is honest about the limit: with a 9,012-token page
+and an 8,000-token budget, there is almost nothing to cut, so 7,704 tokens come
+back — including navigation chrome. The tool earns its keep on **pages several
+times larger than the budget**, where it drops 93% of the page. On pages just
+above the budget, expect little.
 
 ## Quick start
 
