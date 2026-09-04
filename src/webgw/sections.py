@@ -136,7 +136,17 @@ def split(markdown: str) -> list[Section]:
         sec = Section(
             id=f"s{idx}", level=lv, title=ti, body=body, position=idx, tokens=tokens.count(body)
         )
-        if sec.tokens >= MIN_SECTION_TOKENS:
+        # Admit on the link-stripped body, not the raw one. A section whose body
+        # is just "[edit](https://en.wikipedia.org/w/index.php?title=...)" counts
+        # 30 raw tokens -- all of them URL -- and clears a raw threshold while
+        # carrying no prose at all. terms() strips links before scoring, so
+        # admission has to look at the same text or the two disagree.
+        #
+        # Measured 2026-09-04: without this, "how does multi-head attention work"
+        # ranked such a section first (its title matched "work", and BM25's length
+        # normalization inflates short documents), pushing "Attention head" and
+        # "Multihead attention" out of the budget entirely.
+        if tokens.count(strip_links(body)) >= MIN_SECTION_TOKENS:
             candidates.append(sec)
 
     # Drop TOC sections. They carry no content value but outrank real answers,

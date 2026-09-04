@@ -1,7 +1,7 @@
 # webgw
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Docker image](https://img.shields.io/badge/docker-abc99012%2Fwebgw%3A0.3.2-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/abc99012/webgw)
+[![Docker image](https://img.shields.io/badge/docker-abc99012%2Fwebgw%3A0.3.3-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/abc99012/webgw)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![MCP](https://img.shields.io/badge/MCP-2025--11--25-6E56CF)](https://modelcontextprotocol.io)
 
@@ -13,10 +13,10 @@ summary — so a model with an 8k context can read a 90k-token page.
 
 ![webgw reading a 90k-token page twice: BM25 first, then the reranker](demo/demo.gif)
 
-*A real recording, not a mock-up. Same page, same query, two retrieval modes —
-BM25 returns medium confidence on the wrong section, the cross-encoder finds the
-right one, and `cache=hit` shows the retry never re-crawled. Regenerate it with
-[`demo/demo.tape`](demo/demo.tape).*
+*A real recording, not a mock-up. Same page, same query, two retrieval modes.
+`cache=hit` shows the retry never re-crawled. What the two modes actually
+returned is worth reading — see [below](#the-two-pass-workflow-on-one-page).
+Regenerate with [`demo/demo.tape`](demo/demo.tape).*
 
 ## Use it if
 
@@ -78,11 +78,13 @@ correct section ranked first.*
 > notes](#design-notes). They are different experiments, not the same numbers
 > reported twice — do not try to reconcile 18 with 17.
 >
-> Neither harness is in this repository yet. The figures are what was measured
-> during development, but you cannot currently re-run them here, so treat them as
-> the author's measurements rather than as independently verifiable results.
-> Committing the harness is the top item under [Not
-> implemented](#not-implemented).
+> Neither of those two harnesses is in this repository. The figures are what was
+> measured during development, so treat them as the author's measurements rather
+> than as independently verifiable results.
+>
+> [`bench/`](bench/) is the start of fixing that: hermetic, committed, wired into
+> the test suite. It does **not** reproduce the numbers above — it pins specific
+> behaviours, including one ranking bug these figures never caught.
 
 ## What it actually does
 
@@ -123,15 +125,30 @@ answer (`k1 ∈ [1.2, 2.0]`, `b = 0.75`) is intact and quotable.
 Same URL, same query — `how does multi-head attention work` on the Transformer
 article (89,847 raw tokens):
 
-| | top-ranked section | confidence | time |
-|---|---|---|---|
-| `mode="bm25"` | "Subsequent work" | medium (5.53) | 0.7 s |
-| `mode="rerank"` | **"Multi-Query Attention"** | high (0.97) | 8.3 s |
+| | top 5 sections returned | confidence |
+|---|---|---|
+| `mode="bm25"` | Subsequent work · Transformer (interlanguage links) · FlashAttention · Parallelizing attention · Tokenization | medium (5.53) |
+| `mode="rerank"` | Multi-Query Attention · **Multihead attention** · Encoder · Methods for stabilizing training · **Attention head** | high (0.97) |
 
-BM25 put a section that merely mentions attention first; the cross-encoder found
-the section actually about the mechanism. This is the case `mode="rerank"` exists
-for — and because raw content is cached, the retry cost only the reranking, not
-another crawl.
+Read the contents, not the headline. BM25's first pick was a **36-token section
+whose entire body is an `[edit]` link**, and its second was 2,800 tokens of
+interlanguage links — 45% of that budget was chrome. `Attention head` and
+`Multihead attention`, which actually answer the question, were pushed out.
+
+Reranking recovered both. Its top pick, *Multi-Query Attention*, is a variant
+rather than the explanation — the value is that the answer is now **in the five**,
+not that position 1 is perfect. `Attention head` at position 5 carries every term
+the mechanism needs: query, key, value, softmax, scaled dot-product, attention
+weight.
+
+Because raw content is cached, the retry cost only the reranking, not another
+crawl.
+
+> Measured on **0.3.2**. The chrome BM25 returned was a bug — a section admitted
+> on its raw token count while carrying no prose — fixed in 0.3.3 and pinned by
+> [`bench/`](bench/). The rerank column is unaffected. The table and the recording
+> above still show 0.3.2 behaviour and will be re-measured after the fix is
+> deployed.
 
 ### Where it does not help much
 
@@ -168,7 +185,7 @@ docker run -d --name webgw -p 127.0.0.1:8080:8080 \
   -e CRAWL4AI_TOKEN=my-crawl-token \
   -e WEBGW_AUTH_TOKEN=my-gateway-token \
   -v webgw-cache:/data \
-  abc99012/webgw:0.3.2
+  abc99012/webgw:0.3.3
 
 curl -s http://127.0.0.1:8080/healthz
 ```
@@ -485,8 +502,15 @@ Choices made from measurement rather than intuition:
   sections to 2.
 - **Document-order truncation when there is no query** — density heuristics lost
   to plain truncation at every budget tested.
-- **No chrome blocklist** — navigation and footers contain no query terms, so
-  they score zero and drop out on their own.
+- **No chrome blocklist** — mostly unnecessary: navigation and footers usually
+  contain no query terms, so they score zero and drop out. **This does not always
+  hold.** Measured counter-example: `how does multi-head attention work` against
+  the Transformer article ranked a 36-token section first whose only body is an
+  `[edit]` link — its title "Subsequent work" matched `work`, and BM25's length
+  normalization (`b=0.75`) inflates short documents. 45% of what that call
+  returned was chrome, while "Attention head" and "Multihead attention" — the
+  sections that answer the query — were pushed out. Reranking recovered both.
+  See [bench/](bench/).
 - **Script normalization** — a Traditional query against Simplified content
   otherwise fails almost entirely: of 21 sections, only the references heading
   scored, by coincidence. Same purpose as lowercasing in English retrieval.
@@ -528,9 +552,10 @@ uv run python scripts/check.py --full    # includes real fetches
 
 ## Not implemented
 
-- **The benchmark harness** — the rank@1 and Chinese-retrieval figures quoted
-  above were measured during development, but the case sets and the runner are
-  not in this repository, so nobody else can reproduce them. Highest priority
+- **The full benchmark harness** — [`bench/`](bench/) now covers retrieval
+  hermetically and runs in the test suite, but it does not reproduce the
+  30-case and 17-case figures quoted above; those sets were never committed.
+  Until they are, treat those numbers as the author's measurements
 - Caching of rerank results — the same page with the same query pays the rerank
   cost again
 - An `auto` mode — needs a signal that predicts BM25 failure; all six candidates
@@ -557,10 +582,14 @@ blocks into an opaque HTTP 500 while `/crawl/stream` names them.
 
 ### Releases
 
-Image: `abc99012/webgw:0.3.2`
-(`sha256:2f28253956c26f47ed097820952b1566a78c77b76d6ff99b04b8e38b06a2211a`)
+Image: `abc99012/webgw:0.3.3`
+(`sha256:68796722bcb2fa6fccc84335dd21c5b3ba6f0568b98ab7af2d8d56f201228b60`)
 
-- **0.3.2** — `RERANKER_API_KEY`, so a commercial rerank endpoint (Cohere, Jina,
+- **0.3.3** — section admission measures the link-stripped body, not the raw one.
+  A section containing only an `[edit]` link cleared the raw-token threshold and,
+  with BM25's short-document boost, could rank first on a one-word title match.
+  Adds [`bench/`](bench/), which pins this and runs in the test suite
+- 0.3.2 — `RERANKER_API_KEY`, so a commercial rerank endpoint (Cohere, Jina,
   Voyage) works as well as a self-hosted one; tool description and all source
   comments in English
 - 0.3.1 — rerank mode no longer reuses BM25's statistics, so

@@ -126,7 +126,7 @@ spec:
         - name: webgw
           # Tag plus digest: the tag is readable, the digest guarantees this
           # exact build is what runs.
-          image: abc99012/webgw:0.3.2@sha256:2f28253956c26f47ed097820952b1566a78c77b76d6ff99b04b8e38b06a2211a
+          image: abc99012/webgw:0.3.3@sha256:68796722bcb2fa6fccc84335dd21c5b3ba6f0568b98ab7af2d8d56f201228b60
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080

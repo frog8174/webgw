@@ -1,6 +1,6 @@
 [project]
 name = "webgw"
-version = "0.3.2"
+version = "0.3.3"
 description = "Query-aware web fetch gateway for local LLM agents (OpenCode / MCP)"
 requires-python = ">=3.11"
 dependencies = [

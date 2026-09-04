@@ -1,7 +1,7 @@
 services:
   webgw:
     build: .
-    image: webgw:0.3.2
+    image: webgw:0.3.3
     container_name: webgw
     ports:
       # Bound to loopback for local testing. In production the Kubernetes
