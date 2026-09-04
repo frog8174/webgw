@@ -1,7 +1,7 @@
 # webgw
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Docker image](https://img.shields.io/badge/docker-abc99012%2Fwebgw%3A0.3.1-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/abc99012/webgw)
+[![Docker image](https://img.shields.io/badge/docker-abc99012%2Fwebgw%3A0.3.2-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/abc99012/webgw)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![MCP](https://img.shields.io/badge/MCP-2025--11--25-6E56CF)](https://modelcontextprotocol.io)
 
@@ -167,7 +167,7 @@ docker run -d --name webgw -p 127.0.0.1:8080:8080 \
   -e CRAWL4AI_TOKEN=my-crawl-token \
   -e WEBGW_AUTH_TOKEN=my-gateway-token \
   -v webgw-cache:/data \
-  abc99012/webgw:0.3.1
+  abc99012/webgw:0.3.2
 
 curl -s http://127.0.0.1:8080/healthz
 ```
@@ -556,10 +556,13 @@ blocks into an opaque HTTP 500 while `/crawl/stream` names them.
 
 ### Releases
 
-Image: `abc99012/webgw:0.3.1`
-(`sha256:1d69c5f5057145acb9df3f1637159de0467691710d9817a7a395c01d157954d9`)
+Image: `abc99012/webgw:0.3.2`
+(`sha256:2f28253956c26f47ed097820952b1566a78c77b76d6ff99b04b8e38b06a2211a`)
 
-- **0.3.1** — rerank mode no longer reuses BM25's statistics, so
+- **0.3.2** — `RERANKER_API_KEY`, so a commercial rerank endpoint (Cohere, Jina,
+  Voyage) works as well as a self-hosted one; tool description and all source
+  comments in English
+- 0.3.1 — rerank mode no longer reuses BM25's statistics, so
   `match.confidence` reflects the ranker actually used
 - 0.3.0 — script normalization, optional cross-encoder reranking, budget 8000,
   `match` signals replacing `query_matched`
