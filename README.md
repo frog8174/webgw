@@ -11,11 +11,12 @@ Exposes a single MCP tool, `web_fetch(url, query)`, over streamable HTTP. Given 
 page and a query, it returns the **verbatim passages** that match, rather than a
 summary — so a model with an 8k context can read a 90k-token page.
 
-```
-web_fetch(url="https://example.com/release-notes", query="breaking changes in 2.0")
-  -> excerpts from the 3 relevant sections, ~8k tokens
-     plus the outline of what was left out, and how much it would cost
-```
+![webgw reading a 90k-token page twice: BM25 first, then the reranker](demo/demo.gif)
+
+*A real recording, not a mock-up. Same page, same query, two retrieval modes —
+BM25 returns medium confidence on the wrong section, the cross-encoder finds the
+right one, and `cache=hit` shows the retry never re-crawled. Regenerate it with
+[`demo/demo.tape`](demo/demo.tape).*
 
 ## Use it if
 
