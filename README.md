@@ -1,5 +1,10 @@
 # webgw
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Docker image](https://img.shields.io/badge/docker-abc99012%2Fwebgw%3A0.3.1-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/abc99012/webgw)
+[![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![MCP](https://img.shields.io/badge/MCP-2025--11--25-6E56CF)](https://modelcontextprotocol.io)
+
 A query-aware web fetch gateway for local LLM agents, built on [crawl4ai](https://github.com/unclecode/crawl4ai).
 
 Exposes a single MCP tool, `web_fetch(url, query)`, over streamable HTTP. Given a
@@ -12,26 +17,47 @@ web_fetch(url="https://example.com/release-notes", query="breaking changes in 2.
      plus the outline of what was left out, and how much it would cost
 ```
 
-## Built against
+## Use it if
 
-| Component | Version | Notes |
-|---|---|---|
-| **crawl4ai** | **0.9.2** | Pinned by digest in `deploy/crawl4ai.yaml`. Not `:latest` — as of 2026-09-01 that tag had already moved to an untested build |
-| MCP protocol | `2025-11-25` | Streamable HTTP transport |
-| `mcp` Python SDK | `>=2.0` (tested on 2.1.1) | 2.x renamed `FastMCP` to `MCPServer`; host/port/stateless moved into `run()` |
-| Python | `>=3.11` | Image ships 3.12 |
+- You run **local models in an agent** (OpenCode, or any MCP client) and have no
+  built-in web fetch. Hosted assistants mostly ship one already.
+- The pages you read are **much larger than your context** — docs, wikis, long
+  release notes. Below is where the saving actually lands.
+- You need **verbatim source text**, not a summary, because you have to quote it
+  or check it.
 
-Several behaviours here are calibrated against **crawl4ai 0.9.2 specifically** and
-should be re-checked when upgrading: it returns `success=True` for 404 pages, it
-binds container loopback when `CRAWL4AI_API_TOKEN` is unset, its
-`PruningContentFilter` drops article headings, and `/crawl` collapses anti-bot
-blocks into an opaque HTTP 500 while `/crawl/stream` names them.
+## Don't use it if
+
+- **The page is only slightly bigger than your budget.** A 9k-token page against
+  an 8k budget returns 7.7k — nearly everything, navigation chrome included.
+  There is nothing to cut.
+- **You want a summary.** This returns passages. Summarising is the caller's job,
+  on content it can verify.
+- **The site blocks crawlers.** Anti-bot walls are reported honestly
+  (`blocked_antibot`) rather than worked around.
+
+## Contents
+
+[Why](#why) · [What it actually does](#what-it-actually-does) ·
+[Quick start](#quick-start) · [Response format](#response-format) ·
+[Two deployment decisions](#two-decisions-that-shape-your-deployment) ·
+[Retrieval modes](#retrieval-modes) · [Outcomes](#outcomes) ·
+[Connecting a client](#connecting-a-client) · [Kubernetes](#kubernetes) ·
+[Configuration](#configuration) · [Caching](#caching) · [Security](#security) ·
+[Design notes](#design-notes) · [Troubleshooting](#troubleshooting) ·
+[Versions](#versions)
 
 ## Why
 
 Local models typically have 8k–32k of context. The median web page is
 **14,451 tokens** of raw markdown — one page eats half the budget — and the
-largest measured was 135,294, which does not fit at all.
+largest measured was 135,294, which does not fit at all.[^1]
+
+[^1]: Median over the 30 pages in this project's own test set (GitHub releases,
+    Wikipedia, arXiv listings, OpenReview, Chinese tech news), counted with
+    `cl100k_base` after crawl4ai's markdown conversion. The 135,294-token page
+    was an OpenReview forum thread. This is a sample from one person's browsing,
+    not a claim about the web at large — see the note on reproducibility below.
 
 Summarising loses information and cannot be verified. webgw instead selects
 verbatim sections by relevance and reports what it left out, so the agent can
@@ -45,6 +71,17 @@ tell whether the answer might be elsewhere and ask again.
 
 *30 ground-truth cases: 12 English, 18 Chinese. rank@1 counts how often the
 correct section ranked first.*
+
+> **On reproducibility.** Two separate case sets are quoted in this README: the
+> 30-case set above, and a 17-case Chinese-only set under [Design
+> notes](#design-notes). They are different experiments, not the same numbers
+> reported twice — do not try to reconcile 18 with 17.
+>
+> Neither harness is in this repository yet. The figures are what was measured
+> during development, but you cannot currently re-run them here, so treat them as
+> the author's measurements rather than as independently verifiable results.
+> Committing the harness is the top item under [Not
+> implemented](#not-implemented).
 
 ## What it actually does
 
@@ -64,6 +101,21 @@ measured, not illustrative.
 
 *Fetch times are with a warm cache; a cold fetch of a large page is 2–6 s. The
 two 10 ms rows never reach the network — admission rejects them before dispatch.*
+
+### What a returned passage looks like
+
+`web_fetch("https://en.wikipedia.org/wiki/Okapi_BM25", "what are k1 and b free
+parameters")` ranks *The ranking function* first (confidence high, 5.22) and
+returns it verbatim. The substring that answers the query:
+
+> …`k 1 {\displaystyle k_{1}}` ![](…) and b are free parameters, usually chosen,
+> in absence of an advanced optimization, as `k 1 ∈ [ 1.2 , 2.0 ]` … and
+> `b = 0.75`.
+
+That is the raw markdown, not cleaned up. On maths-heavy pages the LaTeX and
+image markup comes through — passages are passed on **as they appear on the
+page**, because the point is that you can check them against the source. The
+answer (`k1 ∈ [1.2, 2.0]`, `b = 0.75`) is intact and quotable.
 
 ### The two-pass workflow, on one page
 
@@ -90,7 +142,16 @@ above the budget, expect little.
 
 ## Quick start
 
-Needs Docker and a running crawl4ai.
+Needs Docker and a running crawl4ai. Budget for both:
+
+| | Image | Memory | CPU | Disk |
+|---|---|---|---|---|
+| **webgw** | 266 MB | 128 Mi idle, 512 Mi limit | 0.05–0.5 core | cache, 2 GB cap (4 Gi volume) |
+| **crawl4ai** | ~2 GB (bundles Chromium) | **2 Gi minimum**, 4 Gi limit | 0.5–2 cores | — |
+
+crawl4ai dominates: it runs a real browser, needs `--shm-size=1g`, and its own
+health check warns as available memory falls. webgw itself is small — the work it
+does is tokenising and ranking text, not rendering pages.
 
 ```bash
 # 1. upstream crawler (SECRET_KEY must be >= 32 chars or gunicorn crash-loops)
@@ -122,6 +183,67 @@ uv run --extra dev pytest -q      # 82 passed
 cp .env.example .env              # fill in CRAWL4AI_TOKEN
 uv run python -m webgw
 ```
+
+## Response format
+
+A real response, abridged only where marked. This is the BM25 call from
+[above](#what-a-returned-passage-looks-like):
+
+```jsonc
+{
+  "outcome": "ok",
+  "url":       "https://en.wikipedia.org/wiki/Okapi_BM25",
+  "final_url": "https://en.wikipedia.org/wiki/Okapi_BM25",   // after redirects
+  "status_code": 200,
+  "title": "Okapi BM25 - Wikipedia",
+  "fetched_at": "2026-09-04T03:25:15+00:00",
+
+  "mode": "bm25",                 // passthrough | bm25 | rerank | document_order
+  "raw_tokens": 9012,             // the whole page
+  "returned_tokens": 7704,        // what you are being given
+  "truncated": true,
+  "cache": "miss",                // miss | hit | stale
+
+  "retrieval": { "mode": "bm25", "elapsed_ms": 18 },
+
+  "match": {
+    "source": "bm25",             // which ranker produced these scores
+    "sections_total": 8,
+    "sections_scored": 8,
+    "scored_ratio": 1.0,
+    "top_score": 5.22,
+    "score_gap": 2.07,            // top ÷ runner-up; near 1.0 means a coin flip
+    "confidence": "high"          // high | medium | low | none
+  },
+
+  "excerpts": [
+    {
+      "section_id": "s3",
+      "title": "The ranking function",
+      "level": 2,
+      "tokens": 1529,
+      "truncated": false,
+      "text": "BM25 is a bag-of-words retrieval function that ranks …"   // verbatim
+    }
+    // … 6 more sections, in rank order
+  ],
+
+  "outline_omitted": [
+    { "id": "s8", "level": 2, "title": "External links", "tokens": 1086 }
+  ]
+}
+```
+
+Three fields do the work that a summary cannot:
+
+| Field | Why it matters |
+|---|---|
+| `match.confidence` | Whether the query actually hit this page. `none` means nothing matched and you are getting document order, not relevance. **`bm25` and `rerank` scores are on different scales** — `source` tells you which, so don't compare a 5.22 with a 0.97 |
+| `outline_omitted` | What was left out and what it would cost to ask for it. This is how the caller decides whether the answer is elsewhere, instead of guessing |
+| `raw_tokens` vs `returned_tokens` | How much was actually cut. When these are close, selection did nothing for you |
+
+`outcome` is not always `ok` — see [Outcomes](#outcomes). Treat a failure as a
+failure; do not read an error page as content.
 
 ## Two decisions that shape your deployment
 
@@ -405,6 +527,9 @@ uv run python scripts/check.py --full    # includes real fetches
 
 ## Not implemented
 
+- **The benchmark harness** — the rank@1 and Chinese-retrieval figures quoted
+  above were measured during development, but the case sets and the runner are
+  not in this repository, so nobody else can reproduce them. Highest priority
 - Caching of rerank results — the same page with the same query pays the rerank
   cost again
 - An `auto` mode — needs a signal that predicts BM25 failure; all six candidates
@@ -413,6 +538,23 @@ uv run python scripts/check.py --full    # includes real fetches
 - Horizontal scaling — SQLite plus a ReadWriteOnce PVC pins this to one replica
 
 ## Versions
+
+### Built against
+
+| Component | Version | Notes |
+|---|---|---|
+| **crawl4ai** | **0.9.2** | Pinned by digest in `deploy/crawl4ai.yaml`. Not `:latest` — as of 2026-09-01 that tag had already moved to an untested build |
+| MCP protocol | `2025-11-25` | Streamable HTTP transport |
+| `mcp` Python SDK | `>=2.0` (tested on 2.1.1) | 2.x renamed `FastMCP` to `MCPServer`; host/port/stateless moved into `run()` |
+| Python | `>=3.11` | Image ships 3.12 |
+
+Several behaviours here are calibrated against **crawl4ai 0.9.2 specifically**
+and should be re-checked when upgrading: it returns `success=True` for 404 pages,
+it binds container loopback when `CRAWL4AI_API_TOKEN` is unset, its
+`PruningContentFilter` drops article headings, and `/crawl` collapses anti-bot
+blocks into an opaque HTTP 500 while `/crawl/stream` names them.
+
+### Releases
 
 Image: `abc99012/webgw:0.3.1`
 (`sha256:1d69c5f5057145acb9df3f1637159de0467691710d9817a7a395c01d157954d9`)
